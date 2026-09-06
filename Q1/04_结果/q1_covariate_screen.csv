@@ -3,5 +3,5 @@ age,age,False,,
 GC,GC,False,,
 map_ratio,map_ratio,False,,
 filter_ratio,filter_ratio,False,,
-log_reads,log_reads,True,0.033152,0.033038
+log_reads,log_reads,True,0.033152,0.033037
 IVF,C(IVF)[T.IVF（试管婴儿）];C(IVF)[T.自然受孕],False,,

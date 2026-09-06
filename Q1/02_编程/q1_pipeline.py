@@ -3,26 +3,37 @@
 运行: python q1_pipeline.py   (工作目录任意，路径已固定)
 输入: 官方附件（只读）  输出: Q1/04_结果/*.csv + q1_run_summary.json
 """
-import sys, os, json, re, itertools, warnings
+import sys, os, json, re, itertools, warnings, argparse
 import numpy as np
 import pandas as pd
 import patsy
 import statsmodels.formula.api as smf
 import statsmodels.api as sm
 from scipy import stats as sps
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 sys.stdout.reconfigure(encoding="utf-8")
-warnings.filterwarnings("ignore")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # Q1/
 OUT = os.path.join(ROOT, "04_结果")
-XLSX = r"D:/10/MCM_China/2025/附件.xlsx"
 SEED = 42
 os.makedirs(OUT, exist_ok=True)
 log = {}
 
+ap = argparse.ArgumentParser(description="Q1 关系模型主程序")
+ap.add_argument("--xlsx", default=os.path.join(os.path.dirname(ROOT), "..", "附件.xlsx"),
+                help="官方附件 xlsx 路径（默认：仓库上级目录的 附件.xlsx）")
+args = ap.parse_args()
+XLSX = os.path.abspath(args.xlsx)
+if not os.path.isfile(XLSX):
+    sys.exit(f"附件不存在: {XLSX}；请用 --xlsx 指定官方附件路径")
+log["附件路径"] = XLSX
+
 # ---------------- 1. 读取与清洗 ----------------
-raw = pd.read_excel(XLSX, sheet_name="男胎检测数据")
+xl = pd.ExcelFile(XLSX)
+if "男胎检测数据" not in xl.sheet_names:
+    sys.exit(f"附件缺少工作表“男胎检测数据”，实际为: {xl.sheet_names}")
+raw = xl.parse("男胎检测数据")
 raw.columns = [str(c).strip() for c in raw.columns]
 log["原始记录数"] = len(raw)
 
@@ -71,6 +82,16 @@ log["多记录事件涉及行数"] = int(multi["n"].sum())
 log["核验为同次采血的事件数"] = int(len(verified) + len(week_conflict_keys))
 log["测序日期差分布(天)"] = {int(k): int(v) for k, v in gaps[multi.index].value_counts().sort_index().items()}
 log["孕周字段冲突事件"] = week_conflict_keys
+
+# 孕周冲突事件按“末次月经 + 检测日期”核对（A055|3 推算约 21w+2），不直接平均冲突值
+lmp = pd.to_datetime(df["末次月经"], errors="coerce")
+dtest = pd.to_datetime(df["检测日期"].astype(str), format="%Y%m%d", errors="coerce")
+wk_from_date = (dtest - lmp).dt.days / 7.0
+fix_mask = df["event_key"].isin(week_conflict_keys) & wk_from_date.notna()
+df.loc[fix_mask, "t_weeks"] = wk_from_date[fix_mask]
+log["孕周冲突按日期核对"] = {k: round(float(wk_from_date[df["event_key"] == k].iloc[0]), 3)
+                              for k in week_conflict_keys
+                              if fix_mask[df["event_key"] == k].any()}
 
 # ---------------- 2. 采血级视图 ----------------
 def first(s):
@@ -123,11 +144,19 @@ for key, g in df.groupby("event_key"):
                      "range": float(ys.max() - ys.min())})
 rep_df = pd.DataFrame(reps)
 rep_df.to_csv(os.path.join(OUT, "q1_technical_replicates.csv"), index=False, encoding="utf-8-sig")
+# 事件内合并方差（pooled within-event variance）：两两差不独立，不能统一求 SD
+ssw, dfw = 0.0, 0
+for key, g in df.groupby("event_key"):
+    ys = g["Y染色体浓度"].dropna().values
+    if len(ys) >= 2:
+        ssw += float(((ys - ys.mean()) ** 2).sum())
+        dfw += len(ys) - 1
+s_hat = float(np.sqrt(ssw / dfw))
 all_d = np.array([d for r in reps for d in r["pairwise_diffs"].split(";")], dtype=float)
-s_hat = float(all_d.std(ddof=1) / np.sqrt(2))
 log["技术重复事件数"] = int(len(reps))
 log["重复差中位绝对值"] = round(float(np.median(np.abs(all_d))), 6)
-log["单次测量误差估计s_hat"] = round(s_hat, 6)
+log["单次测量误差估计s_hat(事件内合并方差)"] = round(s_hat, 6)
+log["合并方差自由度"] = int(dfw)
 log["s_hat相对4%阈值"] = round(s_hat / 0.04, 4)
 
 # ---------------- 4. 锚点自检 ----------------
@@ -156,8 +185,20 @@ def spline_cols(data, design_info=None):
                        columns=[f"sp{k}" for k in range(dm.shape[1])])
     return out, design_info
 
+CONV = {"nonconverged_fits": 0, "convergence_warnings": 0, "optimizer_fallbacks": 0}
 def fit(formula, data, reml):
-    return smf.mixedlm(formula, data=data, groups=data["pid"]).fit(reml=reml, method="lbfgs")
+    """拟合并记录收敛状态；lbfgs 失败时退回 nm 再试一次。"""
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        try:
+            r = smf.mixedlm(formula, data=data, groups=data["pid"]).fit(reml=reml, method="lbfgs")
+        except Exception:
+            CONV["optimizer_fallbacks"] += 1
+            r = smf.mixedlm(formula, data=data, groups=data["pid"]).fit(reml=reml, method="nm", maxiter=2000)
+        CONV["convergence_warnings"] += sum(issubclass(x.category, ConvergenceWarning) for x in w)
+    if not getattr(r, "converged", False):
+        CONV["nonconverged_fits"] += 1
+    return r
 
 CORE = "Y ~ t_c + B0_c + dB + t_c:B0_c"
 def m1_rhs(extra=""):
@@ -198,10 +239,7 @@ def woman_cv(formula_builder, data, spline=False, k=5):
             sp_va, _ = spline_cols(va, info)
             tr = pd.concat([tr, sp_tr], axis=1)
             va = pd.concat([va, sp_va], axis=1)
-        try:
-            r = fit(formula_builder(), tr, reml=False)
-        except Exception:
-            r = fit(formula_builder(), tr, reml=False)
+        r = fit(formula_builder(), tr, reml=False)
         pred = r.predict(exog=va)
         err = va["Y"].values - np.asarray(pred)
         g = pd.DataFrame({"pid": va["pid"].values, "e": err})
@@ -282,7 +320,12 @@ def woman_cv_logit(formula, data, k=5):
         r = fit(formula, tr, reml=False)
         lp = np.asarray(r.predict(exog=va))
         e_tr = tr["logitY"].values - np.asarray(r.fittedvalues)
-        pred = logistic(lp[:, None] + e_tr[None, :]).mean(axis=1)   # Duan smearing
+        # 边际预测 = E_b[smearing]：对随机截距 b~N(0,vb) 做 Gauss-Hermite 积分
+        vb = float(r.cov_re.iloc[0, 0])
+        xn, wn = np.polynomial.hermite_e.hermegauss(24)
+        b_nodes = np.sqrt(vb) * xn
+        comp = logistic(lp[:, None, None] + b_nodes[None, :, None] + e_tr[None, None, :]).mean(axis=2)
+        pred = (comp * (wn / np.sqrt(2 * np.pi))[None, :]).sum(axis=1)
         err = va["Y"].values - pred
         g = pd.DataFrame({"pid": va["pid"].values, "e": err})
         wmae.append(float(g.assign(ae=g["e"].abs()).groupby("pid")["ae"].mean().mean()))
@@ -294,7 +337,38 @@ f0l = f0.replace("Y ~", "logitY ~")
 cv_logit = woman_cv_logit(f0l, ev_m)
 log["验证_M0_logit尺度对照"] = {k: round(v, 6) for k, v in cv_logit.items()}
 log["logit对照结论"] = ("logit 尺度更优，需复核尺度选择" if cv_logit["wRMSE"] < cv0["wRMSE"] * 0.98
-                       else "logit 尺度无稳定收益，维持原始尺度高斯模型")
+                       else "logit 尺度（含随机效应积分的边际口径）无稳定收益，维持原始尺度高斯模型")
+
+# ---------------- 8.5 按孕妇 cluster bootstrap 稳健区间（残差重尾/异方差下核验显著性） ----------------
+B_BOOT = 500
+rs_b = np.random.default_rng(20260906)
+pids_all = ev_m["pid"].unique()
+BOOT_TERMS = [t for t in m0_reml.fe_params.index if t != "Intercept"]
+boot_vals = {t: [] for t in BOOT_TERMS}
+boot_fail = 0
+for b in range(B_BOOT):
+    samp = rs_b.choice(pids_all, size=len(pids_all), replace=True)
+    bd = pd.concat([ev_m[ev_m["pid"] == p].assign(pid=f"{p}__{i}")
+                    for i, p in enumerate(samp)], ignore_index=True)
+    try:
+        rb = fit(f0, bd, reml=False)
+        boot_fail += 0 if rb.converged else 1
+        for t in BOOT_TERMS:
+            boot_vals[t].append(float(rb.params[t]))
+    except Exception:
+        boot_fail += 1
+    if (b + 1) % 100 == 0:
+        print(f"bootstrap {b + 1}/{B_BOOT}")
+boot_ci = {t: [float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5))]
+           for t, v in boot_vals.items() if len(v) >= 400}
+log["cluster_bootstrap"] = {"B": B_BOOT, "失败拟合数": boot_fail,
+                            "区间": {t: [round(x, 6) for x in ci] for t, ci in boot_ci.items()}}
+key_ok = all(boot_ci[t][0] > 0 or boot_ci[t][1] < 0 for t in ["t_c", "B0_c"])
+log["稳健区间结论"] = ("孕周与基线BMI的bootstrap稳健区间均不含0，显著性结论在重尾/异方差下保持"
+                      if key_ok else "稳健区间与Wald区间不一致，需在报告中说明")
+assert m0_reml.converged and m1_reml.converged, "最终模型未收敛"
+log["收敛状态"] = dict(CONV)
+log["最终模型收敛"] = {"M0_REML": bool(m0_reml.converged), "M1_REML": bool(m1_reml.converged)}
 
 # ---------------- 9. 效应主表 ----------------
 def r2_lmm(res, data):
@@ -319,6 +393,8 @@ for name, res in [("M0", m0_reml), ("M1", m1_reml)]:
              {"模型": name, "项": "ICC", "估计": vb / (vb + ve)},
              {"模型": name, "项": "边际R2", "估计": r2m},
              {"模型": name, "项": "条件R2", "估计": r2c}]
+for t, ci in boot_ci.items():
+    rows.append({"模型": "M0-bootstrap(B=500,按孕妇)", "项": t, "CI下": ci[0], "CI上": ci[1]})
 rows += [{"模型": "LRT", "项": "孕周非线性分量(M1 vs M0, df=1)",
           "估计": float(lrt_nonlin), "p": float(sps.chi2.sf(lrt_nonlin, 1))},
          {"模型": "LRT", "项": "孕周整体效应(M1 vs 无孕周, df=3)",

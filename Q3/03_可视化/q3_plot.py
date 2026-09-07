@@ -27,28 +27,43 @@ eff = pd.read_csv(os.path.join(RES, "q3_effects_main.csv"))
 bmi_row = eff[(eff["分布"] == "lognormal") & (eff["项"] == "alpha1_B0c")].iloc[0]
 items = [("BMI（每 kg/m²，保留）", bmi_row["时间比TR"], np.exp(bmi_row["CI下"]), np.exp(bmi_row["CI上"]))]
 lab_map = {"age_c": "年龄（每岁）", "height_c": "身高（每 cm）",
-           "IVF": "IUI / IVF（vs 自然受孕）", "preg": "怀孕 2 次 / ≥3 次（vs 1 次）",
-           "birth": "生产 1 次 / 2+ 次（vs 0 次）"}
-for _, r in scr.iterrows():
-    names = r["新增项"].split(";")
-    est = [float(v) for v in str(r["估计"]).split(";")]
-    lo = [float(v) for v in str(r["CI下"]).split(";")]
-    hi = [float(v) for v in str(r["CI上"]).split(";")]
-    labs = lab_map[r["候选"]].split(" / ")
+           "IVF_IUI": "IUI（vs 自然受孕）", "IVF_IVF": "IVF（vs 自然受孕）",
+           "preg_2": "怀孕 2 次（vs 1 次）", "preg_3p": "怀孕 ≥3 次（vs 1 次）",
+           "birth_1": "生产 1 次（vs 0 次）", "birth_2p": "生产 2+ 次（vs 0 次）"}
+def add_items(row, suffix=""):
+    names = str(row["新增项"]).split(";")
+    est = [float(v) for v in str(row["估计"]).split(";")]
+    lo = [float(v) for v in str(row["CI下"]).split(";")]
+    hi = [float(v) for v in str(row["CI上"]).split(";")]
     for k, c in enumerate(names):
-        if max(abs(lo[k]), abs(hi[k])) > 5:   # 稀疏类别区间无效，截断标注
-            items.append((f"{labs[min(k, len(labs)-1)]}（n 过少）", np.exp(est[k]), np.exp(max(lo[k], -2.0)), np.exp(min(hi[k], 2.0))))
+        lab = lab_map.get(c, c) + suffix
+        if max(abs(lo[k]), abs(hi[k])) > 5:
+            items.append((lab + "（n 过少，不可可靠估计）", np.exp(est[k]), None, None))
         else:
-            items.append((f"{labs[min(k, len(labs)-1)]}", np.exp(est[k]), np.exp(lo[k]), np.exp(hi[k])))
+            items.append((lab, np.exp(est[k]), np.exp(lo[k]), np.exp(hi[k])))
+for _, r in scr.iterrows():
+    cmp_ = str(r["比较"])
+    if "IVF" in cmp_ and pd.isna(r.get("估计", np.nan)):
+        items.append(("IUI / IVF（各 2 人，不可可靠估计）", np.nan, None, None))
+    elif cmp_.startswith("单因素"):
+        add_items(r)
+    elif cmp_.startswith("联合"):
+        add_items(r, "（联合模型）")
 fig, ax = plt.subplots(figsize=(6.3, 3.4))
 ys = np.arange(len(items))[::-1]
-for y, (lab, tr, lo, hi), in zip(ys, items):
+for y, (lab, tr, lo, hi) in zip(ys, items):
     color = C1 if "保留" in lab else C_PT
-    ax.plot([lo, hi], [y, y], color=color, lw=1.4)
-    ax.plot([tr], [y], "o", color=color, ms=5)
-    ax.text(3.4, y, lab, va="center", fontsize=7)
+    if lo is None and np.isnan(tr):   # 无估计：仅标签
+        ax.text(0.55, y, "…", fontsize=7, color=C_PT)
+    elif lo is None:   # 区间过宽：点估计 + 双向箭头，不画假区间
+        ax.annotate("", xy=(4.4, y), xytext=(0.55, y), arrowprops=dict(arrowstyle="<->", color=C_PT, lw=1.1))
+        ax.plot([tr], [y], "o", color=C_PT, ms=5)
+    else:
+        ax.plot([lo, hi], [y, y], color=color, lw=1.4)
+        ax.plot([tr], [y], "o", color=color, ms=5)
+    ax.text(4.8, y, lab, va="center", fontsize=7)
 ax.axvline(1.0, color=C_TH, lw=1, ls=":")
-ax.set(xscale="log", xlim=(0.5, 4), yticks=[],
+ax.set(xscale="log", xlim=(0.5, 4.4), yticks=[],
        xlabel="达标时间比 TR（>1 表示达标更晚；横线=95%CI，log 尺度）",
        title="多因素对首次达标时间的影响：仅 BMI 的区间不含 1")
 save(fig, "result_q3_effect_forest.png")
@@ -66,7 +81,7 @@ for gi, (i, j) in enumerate(cuts):
     cc = [C1, C2][gi]
     ax.plot(TGRID, pbar, color=cc, lw=1.6,
             label=f"{row['BMI区间']}（n={row['人数']}）：推荐 {row['推荐孕周']:.1f} 周")
-    ax.plot([row["推荐孕周"]], [row["达标比例p(t*)"]], "o", color=cc, ms=6)
+    ax.plot([row["推荐孕周"]], [row["首次跨越概率F(t*)"]], "o", color=cc, ms=6)
     ax.axvline(row["推荐孕周"], color=cc, lw=0.7, ls=":", alpha=0.6)
 ax.axhline(0.95, color=C_TH, lw=1, ls=":")
 ax.text(11.2, 0.952, "可靠度 0.95", color=C_TH, fontsize=7)

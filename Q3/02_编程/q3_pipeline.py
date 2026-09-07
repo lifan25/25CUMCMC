@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats as sps, optimize as opt
 from collections import Counter
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
 from functools import lru_cache
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -119,7 +121,8 @@ def fit_se(data, cols, dist="lognormal"):
             ei, ej = np.zeros(n), np.zeros(n); ei[i] = eps; ej[j] = eps
             H[i, j] = (nll(x + ei + ej, data, X) - nll(x + ei - ej, data, X)
                        - nll(x - ei + ej, data, X) + nll(x - ei - ej, data, X)) / (4 * eps ** 2)
-    return r, np.sqrt(np.diag(np.linalg.inv(H)))
+    cov = np.linalg.inv(H)
+    return r, np.sqrt(np.diag(cov)), cov
 
 # 锚点 A：多变量仿真恢复
 a0_t, a1_t, g_t, sig_t = np.log(15.0), 0.030, np.array([0.010, -0.008]), 0.40
@@ -177,40 +180,109 @@ def cv_nll(data, cols, k=5):
     return tot, fails
 
 base_nll, base_fails = cv_nll(cen, [])
+
+def wald_block(r, cov, idxs):
+    """因素级联合 Wald 检验（卡方，df=块大小）。"""
+    g = r.x[idxs]
+    V = cov[np.ix_(idxs, idxs)]
+    chi2 = float(g @ np.linalg.solve(V, g))
+    return chi2, len(idxs), float(sps.chi2.sf(chi2, len(idxs)))
+
 screen = []
 kept = []
 cur = []
+# 单因素逐个评价（整体口径：CV 改善为主条件，联合 Wald 为参考，不要求逐 dummy 显著）
 for name, cols in CANDS.items():
+    if name == "IVF":
+        screen.append({"比较": "单因素：IVF/IUI", "新增项": "IVF_IUI;IVF_IVF", "评价": "各仅 2 人，现有数据无法可靠估计，不进入正式比较",
+                       "CV_NLL_基线": "", "CV_NLL_加入后": "", "联合Wald_p": "", "保留": "不适用"})
+        continue
     trial = cur + cols
-    r, se = fit_se(cen, trial)
-    ci_lo = r.x - 1.96 * se; ci_hi = r.x + 1.96 * se
-    new_pars = r.x[2:-1][-len(cols):] if cols else np.array([])
-    n_new = len(cols)
-    lo_new = ci_lo[2 + len(cur):2 + len(cur) + n_new] if n_new else []
-    hi_new = ci_hi[2 + len(cur):2 + len(cur) + n_new] if n_new else []
-    ci_ok = all((l > 0) or (h < 0) for l, h in zip(lo_new, hi_new)) if n_new else False
+    r, se, cov_t = fit_se(cen, trial)
+    idxs = list(range(2 + len(cur), 2 + len(cur) + len(cols)))
+    chi2, dfw, pw = wald_block(r, cov_t, idxs)
     nll_trial, _ = cv_nll(cen, trial)
     nll_cur, _ = cv_nll(cen, cur)
     cv_ok = nll_trial < nll_cur
-    est_new = r.x[2 + len(cur):2 + len(cur) + n_new] if n_new else []
-    screen.append({"候选": name, "新增项": ";".join(cols), "区间不含0": ci_ok,
+    est_new = r.x[idxs]
+    lo_new = (r.x - 1.96 * se)[idxs]; hi_new = (r.x + 1.96 * se)[idxs]
+    keep = bool(cv_ok and pw < 0.05)
+    screen.append({"比较": f"单因素：{name}", "新增项": ";".join(cols),
                    "估计": ";".join(f"{v:.5f}" for v in est_new),
                    "CI下": ";".join(f"{v:.5f}" for v in lo_new),
                    "CI上": ";".join(f"{v:.5f}" for v in hi_new),
                    "时间比TR": ";".join(f"{np.exp(v):.4f}" for v in est_new),
-                   "CV_NLL_现": round(nll_cur, 2),
-                   "CV_NLL_加入后": round(nll_trial, 2), "保留": bool(ci_ok and cv_ok)})
-    if ci_ok and cv_ok:
+                   "联合Wald_chi2": round(chi2, 2), "联合Wald_df": dfw, "联合Wald_p": round(pw, 4),
+                   "CV_NLL_基线": round(nll_cur, 2), "CV_NLL_加入后": round(nll_trial, 2),
+                   "评价": f"CV改善={cv_ok}, Wald p={pw:.3f}", "保留": keep})
+    if keep:
         cur = trial
         kept.append(name)
+
+# 正式联合对照：BMI vs BMI+年龄+身高
+joint_cols = ["age_c", "height_c"]
+nll_joint, _ = cv_nll(cen, joint_cols)
+r_j, se_j, cov_j = fit_se(cen, joint_cols)
+chi2j, dfj, pwj = wald_block(r_j, cov_j, [2, 3])
+screen.append({"比较": "联合：BMI+年龄+身高", "新增项": ";".join(joint_cols),
+               "估计": ";".join(f"{v:.5f}" for v in r_j.x[[2, 3]]),
+               "CI下": ";".join(f"{v:.5f}" for v in (r_j.x - 1.96 * se_j)[[2, 3]]),
+               "CI上": ";".join(f"{v:.5f}" for v in (r_j.x + 1.96 * se_j)[[2, 3]]),
+               "时间比TR": ";".join(f"{np.exp(v):.4f}" for v in r_j.x[[2, 3]]),
+               "联合Wald_chi2": round(chi2j, 2), "联合Wald_df": dfj, "联合Wald_p": round(pwj, 4),
+               "CV_NLL_基线": round(base_nll, 2), "CV_NLL_加入后": round(nll_joint, 2),
+               "评价": "联合模型无训练外增益" if nll_joint >= base_nll else "联合模型有增益，需复核",
+               "保留": False})
+log["联合对照_BMI_vs_BMI+年龄+身高"] = {"CV_NLL_BMI": round(base_nll, 2), "CV_NLL_联合": round(nll_joint, 2),
+                                          "联合Wald_p": round(pwj, 4)}
+
+# 孕产史扩展组联合评价
+ext_cols = ["preg_2", "preg_3p", "birth_1", "birth_2p"]
+nll_ext, _ = cv_nll(cen, ext_cols)
+r_e, se_e, cov_e = fit_se(cen, ext_cols)
+chi2e, dfe, pwe = wald_block(r_e, cov_e, [2, 3, 4, 5])
+screen.append({"比较": "扩展组：孕产史（4 哑变量）", "新增项": ";".join(ext_cols),
+               "估计": ";".join(f"{v:.5f}" for v in r_e.x[2:6]),
+               "CI下": ";".join(f"{v:.5f}" for v in (r_e.x - 1.96 * se_e)[2:6]),
+               "CI上": ";".join(f"{v:.5f}" for v in (r_e.x + 1.96 * se_e)[2:6]),
+               "时间比TR": ";".join(f"{np.exp(v):.4f}" for v in r_e.x[2:6]),
+               "联合Wald_chi2": round(chi2e, 2), "联合Wald_df": dfe, "联合Wald_p": round(pwe, 4),
+               "CV_NLL_基线": round(base_nll, 2), "CV_NLL_加入后": round(nll_ext, 2),
+               "评价": "孕产史整体无训练外增益；生产 2+ 仅 18 人，单项区间不稳定仅作参考" if nll_ext >= base_nll else "孕产史整体有增益，需复核",
+               "保留": False})
+log["扩展组_孕产史"] = {"CV_NLL_BMI": round(base_nll, 2), "CV_NLL_扩展": round(nll_ext, 2),
+                        "联合Wald_p": round(pwe, 4)}
+
+# 重复 CV 的增益波动（联合模型 vs BMI，10 组不同折划分）
+gain_reps = []
+for rs_i in range(10):
+    pids = np.array(sorted(cen["pid"].unique()))
+    rs = np.random.default_rng(1000 + rs_i); rs.shuffle(pids)
+    folds = np.array_split(pids, 5)
+    def cv_once(cols):
+        nll = nll_gen("lognormal"); tot = 0.0
+        for f in folds:
+            tr, va = cen[~cen["pid"].isin(f)], cen[cen["pid"].isin(f)]
+            try:
+                rr = fit_aft(tr, cols)
+                tot += nll(rr.x, va, Xmat(va, cols))
+            except Exception:
+                tot += 1e6
+        return tot
+    gain_reps.append(cv_once([]) - cv_once(joint_cols))
+gain_reps = np.array(gain_reps)
+log["联合模型重复CV增益分布(NLL_BMI-NLL_联合,负=BMI更优)"] = {
+    "均值": round(float(gain_reps.mean()), 2),
+    "最小": round(float(gain_reps.min()), 2), "最大": round(float(gain_reps.max()), 2),
+    "10次重复中联合模型更优次数": int((gain_reps > 0).sum())}
 log["协变量筛选"] = screen
 log["保留协变量"] = kept
 pd.DataFrame(screen).to_csv(os.path.join(OUT, "q3_screen.csv"), index=False, encoding="utf-8-sig")
 FINAL_COLS = cur
 
 # ---------------- 4. 最终模型（两分布） ----------------
-r_ln, se_ln = fit_se(cen, FINAL_COLS, "lognormal")
-r_wb, se_wb = fit_se(cen, FINAL_COLS, "weibull")
+r_ln, se_ln, cov_ln = fit_se(cen, FINAL_COLS, "lognormal")
+r_wb, se_wb, cov_wb = fit_se(cen, FINAL_COLS, "weibull")
 aic_ln, aic_wb = 2 * r_ln.fun + 2 * len(r_ln.x), 2 * r_wb.fun + 2 * len(r_wb.x)
 dist = "lognormal" if aic_ln <= aic_wb else "weibull"
 r_best, se_best = (r_ln, se_ln) if dist == "lognormal" else (r_wb, se_wb)
@@ -302,13 +374,38 @@ def group_rows(cuts, P, label):
         out.append({"方案": label, "组": gi,
                     "BMI区间": f"[{blo:.1f}, {bhi:.1f})" if np.isfinite(bhi) else f"[{blo:.1f}, ∞)",
                     "人数": m, "推荐孕周": float(TGRID[k]),
-                    "达标比例p(t*)": round(float(pbar[k]), 4), "约束满足": feas})
+                    "首次跨越概率F(t*)": round(float(pbar[k]), 4), "约束满足": feas})
     return out
 
 cuts_main = base[g_chosen]["cuts"]
 main_df = pd.DataFrame(group_rows(cuts_main, P_ord, "Q3多因素约束型主方案(F口径)"))
+main_df = main_df.rename(columns={"达标比例p(t*)": "首次跨越概率F(t*)"})
+
+# 当次达标概率核验（GEE 观测口径，中心化与训练一致）：推荐时点当次 p 与窗口峰值
+gev = ev1.copy()
+gev["tc"] = gev["t_weeks"] - 18
+gev["B0c"] = gev["B0"] - B0mean
+gmod = smf.gee("y_hit ~ tc + B0c", groups="pid", data=gev, family=sm.families.Binomial()).fit()
+def p_gee(t, b0c_vals):
+    tcv = np.atleast_1d(t)[:, None] - 18.0
+    b = np.atleast_1d(b0c_vals)[None, :]
+    eta = gmod.params["Intercept"] + gmod.params["tc"] * tcv + gmod.params["B0c"] * b
+    return 1 / (1 + np.exp(-eta))
+P_gee = p_gee(TGRID, cen["B0c"].values)
+P_gee_ord = P_gee[:, oidx]
+p_now, p_peak = [], []
+for (i, j) in cuts_main:
+    pbar = P_gee_ord[:, i:j].mean(axis=1)
+    t_star = float(main_df["推荐孕周"].iloc[len(p_now)])
+    kt = int(np.argmin(np.abs(TGRID - t_star)))
+    p_now.append(round(float(pbar[kt]), 4))
+    p_peak.append(round(float(pbar.max()), 4))
+main_df["当次达标概率p(t*)_GEE"] = p_now
+main_df["当次达标概率_25周峰值_GEE"] = p_peak
 main_df.to_csv(os.path.join(OUT, "q3_groups_main.csv"), index=False, encoding="utf-8-sig")
 log["主方案"] = main_df.to_dict("records")
+log["当次核验(GEE)"] = {"说明": "F(t*)≥0.95 不等于当次达标比例≥0.95；观测当次口径含误差与反转",
+                          "各组推荐时点当次p": p_now, "各组25周峰值": p_peak}
 log["锚点C_低组不晚于高组"] = bool(main_df["推荐孕周"].iloc[0] <= main_df["推荐孕周"].iloc[-1])
 
 # 组间协变量均值（检查 t* 差异来源）
@@ -332,12 +429,12 @@ for gi in range(1, g_chosen + 1):
     vs.append({"组": gi, "Q2_BMI区间": q2r["BMI区间"] if q2r is not None else "",
                "Q2_推荐孕周": q2r["推荐孕周"] if q2r is not None else "",
                "Q3_BMI区间": q3r["BMI区间"], "Q3_推荐孕周": q3r["推荐孕周"],
-               "Q3_达标比例": q3r["达标比例p(t*)"]})
+               "Q3_F(t*)": q3r["首次跨越概率F(t*)"]})
 vs.append({"组": "平均推荐孕周", "Q2_BMI区间": "", "Q2_推荐孕周": round(float(q2f["推荐孕周"].mean()), 2),
-           "Q3_BMI区间": "", "Q3_推荐孕周": round(float(main_df["推荐孕周"].mean()), 2), "Q3_达标比例": ""})
+           "Q3_BMI区间": "", "Q3_推荐孕周": round(float(main_df["推荐孕周"].mean()), 2), "Q3_F(t*)": ""})
 base_cv_ln, _ = cv_nll(cen, FINAL_COLS)
 vs.append({"组": "CV删失NLL(小者优)", "Q2_BMI区间": "仅BMI", "Q2_推荐孕周": round(base_nll, 1),
-           "Q3_BMI区间": "BMI+" + "+".join(kept), "Q3_推荐孕周": round(base_cv_ln, 1), "Q3_达标比例": ""})
+           "Q3_BMI区间": "BMI+" + "+".join(kept), "Q3_推荐孕周": round(base_cv_ln, 1), "Q3_F(t*)": ""})
 pd.DataFrame(vs).to_csv(os.path.join(OUT, "q3_vs_q2.csv"), index=False, encoding="utf-8-sig")
 log["Q3相对Q2"] = {"平均推荐孕周变化": round(float(main_df["推荐孕周"].mean() - q2f["推荐孕周"].mean()), 3),
                      "CV_NLL_仅BMI": round(base_nll, 1), "CV_NLL_多因素": round(base_cv_ln, 1),
@@ -420,7 +517,7 @@ log["分布与阈值敏感性"] = sens_df.to_dict("records")
 
 # ---------------- 7. bootstrap 稳定性 ----------------
 B_BOOT = 200
-stab, scheme_ok = [], []
+stab, scheme_ok, frozen_ok = [], [], []
 for b in range(B_BOOT):
     rng_b = np.random.default_rng(SEED + b)
     bc = cen.iloc[rng_b.choice(len(cen), size=len(cen), replace=True)].reset_index(drop=True)
@@ -448,8 +545,22 @@ for b in range(B_BOOT):
             stab.append({"b": b, "组": gi, "t*": float(TGRID[k]),
                          "bounds": ";".join(f"{x:.1f}" for x in bounds), "feas": feas})
         scheme_ok.append(feas_all)
+        # 冻结方案（BMI 阈值 30.76，t*=17.0/20.5）在该 bootstrap 样本上的约束满足情况
+        frozen_t = [17.0, 20.5][:g_chosen]
+        bmi_thr = 30.76
+        grp_id = (ob0 >= bmi_thr).astype(int)
+        ok_frz = True
+        for gi in range(g_chosen):
+            cols = np.where(grp_id == gi)[0]
+            if len(cols) < 10:
+                ok_frz = False; break
+            kt = int(np.argmin(np.abs(TGRID - frozen_t[gi])))
+            if Fb_ord[kt, cols].mean() < P_THRESH:
+                ok_frz = False
+        frozen_ok.append(ok_frz)
     except Exception:
         scheme_ok.append(False)
+        frozen_ok.append(False)
     if (b + 1) % 50 == 0:
         print(f"bootstrap {b + 1}/{B_BOOT}")
 stab_df = pd.DataFrame(stab)
@@ -468,7 +579,8 @@ with open(os.path.join(OUT, "q3_stability.csv"), "w", encoding="utf-8-sig", newl
         f.write(f"{x},{c}\n")
 log["稳定性_t*"] = tstats.to_dict()
 log["稳定性_分界点频次前5"] = bcnt.most_common(5)
-log["bootstrap整套方案可行率"] = round(float(np.mean(scheme_ok)), 4)
+log["bootstrap整套方案可行率(重优化)"] = round(float(np.mean(scheme_ok)), 4)
+log["bootstrap冻结方案(30.8,17/20.5)约束满足率"] = round(float(np.mean(frozen_ok)), 4)
 if g_chosen == 2:
     bvals = np.array([float(s) for s in stab_df.loc[stab_df["组"] == 1, "bounds"]])
     log["稳定性_分界点90%区间"] = [round(float(np.quantile(bvals, 0.05)), 1),

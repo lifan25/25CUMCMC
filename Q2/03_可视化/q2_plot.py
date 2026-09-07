@@ -64,24 +64,24 @@ ax.set(xlabel="检测孕周（周）", ylabel="首次达标累计概率 F(t|BMI)
 ax.legend(frameon=False, fontsize=7, loc="lower right")
 save(fig, "result_q2_survival_curves.png")
 
-# 图3 原始数据图：校准（观测 vs 预测）
+# 图3 原始数据图：校准双面板（当次 GEE + 生存 F，目标不同分开呈现）
 cal = pd.read_csv(os.path.join(RES, "q2_calibration.csv"))
-fig, ax = plt.subplots(figsize=(4.8, 3.4))
+scal = pd.read_csv(os.path.join(RES, "q2_calibration_survival.csv"))
+fig, axes = plt.subplots(1, 2, figsize=(6.3, 3.0))
 mk = {"低": "o", "中": "s", "高": "^"}
 for b3, g in cal.groupby("BMI组"):
-    ax.scatter(g["观测当次达标率"], g["预测F(AFT)"], marker=mk[b3], s=30,
-               facecolors="none", edgecolors=C1)
-    ax.scatter(g["观测当次达标率"], g["预测p(GEE)"], marker=mk[b3], s=30,
-               facecolors="none", edgecolors=C2)
-from matplotlib.lines import Line2D
-handles = [Line2D([], [], marker="o", ls="", mec="#333333", mfc="none", label="形状：低/中/高 BMI 组"),
-           Line2D([], [], marker="o", ls="", mec=C1, mfc="none", label="F(AFT)"),
-           Line2D([], [], marker="o", ls="", mec=C2, mfc="none", label="p(GEE)")]
-ax.plot([0.5, 1], [0.5, 1], color="#333333", lw=0.8)
-ax.set(xlabel="观测当次达标率（BMI三分组×时间箱）", ylabel="模型预测", xlim=(0.5, 1.0), ylim=(0.5, 1.0))
-ax.legend(handles=handles, frameon=False, fontsize=6.5, loc="upper left")
+    axes[0].scatter(g["观测当次达标率"], g["预测p(GEE)"], marker=mk[b3], s=30,
+                    facecolors="none", edgecolors=C2, label=f"{b3}BMI组")
+axes[0].plot([0.5, 1], [0.5, 1], color="#333333", lw=0.8)
+axes[0].set(xlabel="观测当次达标率", ylabel="预测 p(GEE)", xlim=(0.5, 1.0), ylim=(0.5, 1.0),
+            title="当次达标概率校准（GEE）")
+axes[0].legend(frameon=False, fontsize=6.5, loc="upper left")
+xr = [scal["预测均值"].min() - 0.02, 1.0]
+axes[1].scatter(scal["预测均值"], scal["观测比例"], s=30, facecolors="none", edgecolors=C1)
+axes[1].plot([0.8, 1], [0.8, 1], color="#333333", lw=0.8)
+axes[1].set(xlabel="预测 F(t_last)（十分位箱均值）", ylabel="观测首次达标比例",
+            xlim=(0.8, 1.0), ylim=(0.8, 1.05), title="首次跨越概率校准（AFT）")
 save(fig, "raw_q2_calibration.png")
-
 # 图4 过程图：bootstrap 稳定性（分界点分布 + t* 分布）
 stab = pd.read_csv(os.path.join(RES, "q2_stability_boot.csv"))
 fig, axes = plt.subplots(1, 2, figsize=(6.3, 2.9), gridspec_kw={"width_ratios": [1, 1.2]})

@@ -29,20 +29,26 @@ S_HAT = float(q1sum["单次测量误差估计s_hat(事件内合并方差)"])
 log["误差s_hat"] = S_HAT
 
 # ---------------- 1. 删失构造 ----------------
-rows = []
-for pid, g in ev.sort_values("t_weeks").groupby("pid"):
-    t, h = g["t_weeks"].values, g["y_hit"].values
-    first_hit = np.argmax(h) if h.any() else None
-    if first_hit is None:
-        typ, L, R = "右删失", t[-1], np.inf
-    elif first_hit == 0:
-        typ, L, R = "左删失", 0.0, t[0]
-    else:
-        typ, L, R = "区间删失", t[first_hit - 1], t[first_hit]
-    rev = bool(first_hit is not None and (h[first_hit:] == 0).any())
-    rows.append({"pid": pid, "B0": g["B0"].iloc[0], "censor_type": typ, "L": L, "R": R,
-                 "n_events": len(t), "t_first": t[0], "t_last": t[-1], "reversed": rev})
-cen = pd.DataFrame(rows)
+def build_censoring(threshold):
+    rows = []
+    for pid, g in ev.sort_values("t_weeks").groupby("pid"):
+        t = g["t_weeks"].values
+        h = (g["Y"].values >= threshold).astype(int)
+        first_hit = np.argmax(h) if h.any() else None
+        if first_hit is None:
+            typ, L, R = "右删失", t[-1], np.inf
+        elif first_hit == 0:
+            typ, L, R = "左删失", 0.0, t[0]
+        else:
+            typ, L, R = "区间删失", t[first_hit - 1], t[first_hit]
+        rev = bool(first_hit is not None and (h[first_hit:] == 0).any())
+        rows.append({"pid": pid, "B0": g["B0"].iloc[0], "censor_type": typ, "L": L, "R": R,
+                     "n_events": len(t), "t_first": t[0], "t_last": t[-1], "reversed": rev})
+    out = pd.DataFrame(rows)
+    out["B0c"] = out["B0"] - out["B0"].mean()
+    return out
+cen = build_censoring(0.04)
+cen = cen.drop(columns=["B0c"])  # 下文统一以全体均值重建 B0c
 cen.to_csv(os.path.join(OUT, "q2_censoring.csv"), index=False, encoding="utf-8-sig")
 log["删失计数"] = cen["censor_type"].value_counts().to_dict()
 log["反转人数"] = int(cen["reversed"].sum())
@@ -158,15 +164,17 @@ gmod = g_qd if use_qd else g_lin
 log["当次模型二次项保留"] = use_qd
 def p_gee(t, b0c_vals):
     t = np.atleast_1d(t)[:, None]; b = np.atleast_1d(b0c_vals)[None, :]
-    eta = gmod.params["Intercept"] + gmod.params["tc"] * t + gmod.params["B0c"] * b
+    tcv = t - 18.0   # 与训练口径一致：模型拟合的是 tc=t_weeks-18
+    eta = gmod.params["Intercept"] + gmod.params["tc"] * tcv + gmod.params["B0c"] * b
     if use_qd:
-        eta = eta + gmod.params["tc2"] * t ** 2
+        eta = eta + gmod.params["tc2"] * tcv ** 2
     return 1 / (1 + np.exp(-eta))
 P_grid = p_gee(TGRID, cen["B0c"].values)
 mad = float(np.mean(np.abs(F_grid - P_grid))); maxd = float(np.max(np.abs(F_grid - P_grid)))
 log["F与当次p比较"] = {"平均绝对差": round(mad, 4), "最大绝对差": round(maxd, 4),
-                        "结论": ("F 为删失模型，回答“首次达标时间”；当次 p 受反转影响。高 BMI 尾端差异"
-                                f"{maxd:.2f}，推荐时点以 F 为主口径、当次 p 为对照，两口径均报告")}
+                        "结论": ("F 为首次跨越累计概率，p 为当次检测成功概率，目标不同不互相替代；"
+                                "F 的删失区间由含测量误差的 y_hit 构造，其估计同样含误差影响。"
+                                f"高 BMI 尾端差异 {maxd:.2f}，两口径均报告")}
 
 # ---------------- 4. 主方案：可靠度约束 + DP 最小化总人·周 ----------------
 order = cen.sort_values("B0")
@@ -194,6 +202,8 @@ def optimize_constraint(P, gmax=5, min_n=MIN_N):
         m = j - i
         pbar = (Psum[:, j] - Psum[:, i]) / m
         k, feas = earliest_t(pbar)
+        if not feas:
+            return float("inf"), k, feas   # 严格 p>=0.95 约束：不可行段不进入最优解
         return m * k, k, feas
     results = {}
     for g in range(2, gmax + 1):
@@ -215,7 +225,7 @@ def optimize_constraint(P, gmax=5, min_n=MIN_N):
     return results
 
 base = optimize_constraint(P_ord)
-mean_weeks = {g: base[g]["cost"] / N * 0.5 + 11 for g in base}
+mean_weeks = {g: (base[g]["cost"] / N * 0.5 + 11 if base[g]["cost"] < 1e17 else np.inf) for g in base}
 log["约束方案各组数平均推荐孕周"] = {g: round(v, 3) for g, v in mean_weeks.items()}
 g_chosen = 2
 for g in range(3, 6):
@@ -304,40 +314,84 @@ log["锚点C_极端权重"] = {"wd=0取候选域末端": all(TGRID[k] == TGRID[-
                          "wf=0取最早时点": all(TGRID[k] == TGRID[0] for k in t_idx_wf0)}
 assert log["锚点C_极端权重"]["wd=0取候选域末端"] and log["锚点C_极端权重"]["wf=0取最早时点"]
 
-# ---------------- 6. 误差影响 ----------------
+# ---------------- 6. 误差影响与分布敏感性 ----------------
 def q1coef(term):
     return float(eff[(eff["模型"] == "M0") & (eff["项"] == term)]["估计"].iloc[0])
 b0_, b1_, b2_, b4_ = q1coef("Intercept"), q1coef("t_c"), q1coef("B0_c"), q1coef("t_c:B0_c")
 gam_ = q1coef("log_reads")
-s2 = q1coef("sigma_b^2(随机截距方差)") + q1coef("sigma^2(残差方差)")
+s2_obs = q1coef("sigma_b^2(随机截距方差)") + q1coef("sigma^2(残差方差)")
+# 方差分解：Q1 事件级残差方差已含单次测量误差 ŝ²（981/1021 事件为单次测序），
+# 潜在（个体+生物）方差 = 观测方差 − ŝ²；含误差观测方差即 s2_obs，不能再叠加 ŝ²。
+s2_lat = max(s2_obs - S_HAT ** 2, 1e-8)
+log["方差分解"] = {"观测方差s2_obs": round(s2_obs, 7), "测量误差ŝ^2": round(S_HAT ** 2, 7),
+                    "潜在方差s2_lat": round(s2_lat, 7)}
 lr_med = float(ev["log_reads"].median())
 tc_g = TGRID - 18
 m_curve = (b0_ + b1_ * tc_g[:, None] + b2_ * cen["B0c"].values[None, :]
            + b4_ * np.outer(tc_g, cen["B0c"].values) + gam_ * lr_med)
-p0 = 1 - sps.norm.cdf((0.04 - m_curve) / np.sqrt(s2))
-p1 = 1 - sps.norm.cdf((0.04 - m_curve) / np.sqrt(s2 + S_HAT ** 2))
-log["三模型一致性"] = {"F_vs_Q1边际_平均绝对差": round(float(np.mean(np.abs(F_grid - p0))), 4),
-                        "当次p_vs_Q1边际_平均绝对差": round(float(np.mean(np.abs(P_grid - p0))), 4)}
-P0_ord, P1_ord = p0[:, oidx], p1[:, oidx]
+p_lat = 1 - sps.norm.cdf((0.04 - m_curve) / np.sqrt(s2_lat))   # 潜在当次达标概率
+p_obs = 1 - sps.norm.cdf((0.04 - m_curve) / np.sqrt(s2_obs))   # 含误差观测达标概率
+log["三模型一致性"] = {"F_vs_Q1边际(潜在)_平均绝对差": round(float(np.mean(np.abs(F_grid - p_lat))), 4),
+                        "当次pGEE_vs_Q1边际(观测)_平均绝对差": round(float(np.mean(np.abs(P_grid - p_obs))), 4)}
+Plat_ord, Pobs_ord = p_lat[:, oidx], p_obs[:, oidx]
+
 err_rows = []
 for gi, (i, j) in enumerate(cuts_main, 1):
-    for lab, P in [("无测量误差", P0_ord), ("含测量误差ŝ", P1_ord)]:
+    for lab, P in [("潜在(无测量误差)", Plat_ord), ("观测(含测量误差)", Pobs_ord)]:
         pbar = P[:, i:j].mean(axis=1)
         k, feas = earliest_t(pbar)
-        err_rows.append({"组": gi, "口径": lab, "推荐孕周": float(TGRID[k]),
+        err_rows.append({"组": gi, "口径": lab, "推荐孕周(Q1边际方案)": float(TGRID[k]),
                          "p(推荐时点)": round(float(pbar[k]), 4), "约束满足": feas})
-    # 当次误判率（推荐时点，主方案 F 口径时点）
-    pbarL = P0_ord[:, i:j].mean(axis=1); pbarO = P1_ord[:, i:j].mean(axis=1)
-    kL, _ = earliest_t(pbarL)
-    flip = float((pbarL[kL] * (1 - pbarO[kL]) + (1 - pbarL[kL]) * pbarO[kL]))
-    err_rows.append({"组": gi, "口径": "当次误判率估计(Q1边际模型)", "推荐孕周": float(TGRID[kL]),
-                     "p(推荐时点)": round(flip, 4), "约束满足": ""})
+# 当次误判率：同一潜在浓度 Y* 与观测 Y*=Y*+e 的联合正态跨阈值概率（非独立 Bernoulli）
+trapz = getattr(np, "trapezoid", None) or np.trapz
+def flip_prob(m, sL, sh, c=0.04):
+    ys = np.linspace(m - 6 * sL, m + 6 * sL, 2001)
+    pdf = sps.norm.pdf(ys, m, sL)
+    flip = (ys >= c) * sps.norm.cdf((c - ys) / sh) + (ys < c) * sps.norm.sf((c - ys) / sh)
+    return float(trapz(pdf * flip, ys))
+sL = np.sqrt(s2_lat)
+for gi, (i, j) in enumerate(cuts_main, 1):
+    t_star = float(main_df[(main_df["组"] == gi) & (main_df["方案"].str.contains("主方案"))]["推荐孕周"].iloc[0])
+    kt = int(np.argmin(np.abs(TGRID - t_star)))
+    flips = [flip_prob(m_curve[kt, w], sL, S_HAT) for w in range(i, j)]
+    err_rows.append({"组": gi, "口径": "当次误判率(联合正态,主方案时点)", "推荐孕周(Q1边际方案)": t_star,
+                     "p(推荐时点)": round(float(np.mean(flips)), 4), "约束满足": ""})
 err_df = pd.DataFrame(err_rows)
-err_df.to_csv(os.path.join(OUT, "q2_error_impact.csv"), index=False, encoding="utf-8-sig")
-piv = err_df[err_df["口径"].str.contains("误差") & ~err_df["口径"].str.contains("误判")].pivot(index="组", columns="口径", values="推荐孕周")
-log["误差致t*漂移(周)"] = {int(g): float(piv.loc[g, "含测量误差ŝ"] - piv.loc[g, "无测量误差"]) for g in piv.index}
+piv = err_df[err_df["口径"].str.contains("潜在|观测")].pivot(index="组", columns="口径", values="推荐孕周(Q1边际方案)")
+log["误差致t*漂移_Q1边际口径(周)"] = {int(g): float(piv.loc[g, "观测(含测量误差)"] - piv.loc[g, "潜在(无测量误差)"]) for g in piv.index}
+log["当次误判率(联合正态)"] = {int(r["组"]): r["p(推荐时点)"] for _, r in err_df[err_df["口径"].str.contains("误判")].iterrows()}
 
-# ---------------- 7. 校准 ----------------
+# 误差阈值平移敏感性：y_hit 以 0.04±ŝ 重构删失 → 重走 AFT 主链条（直接影响主方案）
+def chain_optimize(dist_name, cen_df, label):
+    rb, _se = fit_with_se(dist_name, cen_df)
+    a0b, a1b, sigb = rb.x[0], rb.x[1], np.exp(rb.x[2])
+    z = (np.log(TGRID)[:, None] - a0b - a1b * cen_df["B0c"].values[None, :]) / sigb
+    Fb = sps.norm.cdf(z) if dist_name == "lognormal" else 1 - np.exp(-np.exp(z))
+    ob = cen_df.sort_values("B0")
+    Fb_ord = Fb[:, ob.index.values]
+    res = optimize_constraint(Fb_ord, gmax=2)
+    out = []
+    for gi, (i, j) in enumerate(res[2]["cuts"], 1):
+        pbar = Fb_ord[:, i:j].mean(axis=1)
+        k, feas = earliest_t(pbar)
+        blo = 20.0 if i == 0 else (B0v[i - 1] + B0v[i]) / 2
+        bhi = np.inf if j == N else (B0v[j - 1] + B0v[j]) / 2
+        out.append({"情景": label, "组": gi,
+                    "BMI区间": f"[{blo:.1f}, {bhi:.1f})" if np.isfinite(bhi) else f"[{blo:.1f}, ∞)",
+                    "人数": j - i, "推荐孕周": float(TGRID[k]),
+                    "p(推荐时点)": round(float(pbar[k]), 4),
+                    "整套方案可行": bool(res[2]["cost"] < 1e17)})
+    return out
+sens_rows = chain_optimize("weibull", cen, "Weibull分布(模型不确定性)")
+for sgn, lab in [(-1, "阈值−ŝ(宽松)"), (1, "阈值+ŝ(严格)")]:
+    cen_s = build_censoring(0.04 + sgn * S_HAT)
+    cen_s["B0c"] = cen_s["B0"] - cen["B0"].mean()
+    sens_rows += chain_optimize("lognormal", cen_s, lab)
+sens_df = pd.DataFrame(sens_rows)
+sens_df.to_csv(os.path.join(OUT, "q2_dist_threshold_sensitivity.csv"), index=False, encoding="utf-8-sig")
+log["分布与阈值敏感性"] = sens_df.to_dict("records")
+err_df.to_csv(os.path.join(OUT, "q2_error_impact.csv"), index=False, encoding="utf-8-sig")
+# ---------------- 7. 校准（当次与生存分开，目标不同不可混比） ----------------
 cal = []
 cen["bmi3"] = pd.qcut(cen["B0"], 3, labels=["低", "中", "高"])
 evcal = ev.copy(); evcal["bmi3"] = evcal["pid"].map(cen.set_index("pid")["bmi3"])
@@ -346,40 +400,58 @@ for (b3, tb), g in evcal.groupby(["bmi3", "tbin"], observed=True):
     mid = tb.mid
     cal.append({"BMI组": b3, "时间箱": str(tb), "事件数": len(g),
                 "观测当次达标率": round(g["y_hit"].mean(), 4),
-                "预测p(GEE)": round(float(p_gee(mid, (g["B0"] - cen["B0"].mean()).values).mean()), 4),
-                "预测F(AFT)": round(float(F_aft(mid, (g["B0"] - cen["B0"].mean()).values).mean()), 4)})
+                "预测p(GEE)": round(float(p_gee(mid, (g["B0"] - cen["B0"].mean()).values).mean()), 4)})
 cal_df = pd.DataFrame(cal)
 cal_df.to_csv(os.path.join(OUT, "q2_calibration.csv"), index=False, encoding="utf-8-sig")
-log["校准平均绝对误差"] = {"p_GEE": round(float((cal_df["观测当次达标率"] - cal_df["预测p(GEE)"]).abs().mean()), 4),
-                            "F_AFT": round(float((cal_df["观测当次达标率"] - cal_df["预测F(AFT)"]).abs().mean()), 4)}
+log["校准平均绝对误差_当次GEE"] = round(float((cal_df["观测当次达标率"] - cal_df["预测p(GEE)"]).abs().mean()), 4)
+
+# 生存校准：F(t_last) 预测 vs 首次达标是否在观测窗内被记录（左/区间=1，右删失=0），按预测十分位分箱
+surv = cen.copy()
+surv["predF_last"] = F_aft(surv["t_last"].values, surv["B0c"].values).diagonal()
+surv["hit_observed"] = (surv["censor_type"] != "右删失").astype(int)
+surv["pred_bin"] = pd.qcut(surv["predF_last"], 10, duplicates="drop")
+scal = surv.groupby("pred_bin", observed=True).agg(
+    人数=("pid", "size"), 预测均值=("predF_last", "mean"), 观测比例=("hit_observed", "mean")).reset_index()
+scal["预测均值"] = scal["预测均值"].round(4); scal["观测比例"] = scal["观测比例"].round(4)
+scal.to_csv(os.path.join(OUT, "q2_calibration_survival.csv"), index=False, encoding="utf-8-sig")
+log["生存校准(F_last十分位)"] = scal.to_dict("records")
+log["生存校准平均绝对误差"] = round(float((scal["预测均值"] - scal["观测比例"]).abs().mean()), 4)
 
 # ---------------- 8. bootstrap 稳定性（主方案） ----------------
 B_BOOT = 200
 stab = []
+scheme_ok = []
 for b in range(B_BOOT):
     rng_b = np.random.default_rng(SEED + b)
     bc = cen.iloc[rng_b.choice(len(cen), size=len(cen), replace=True)].reset_index(drop=True)
     bc["B0c"] = bc["B0"] - cen["B0"].mean()
     try:
         rb = fit_aft(dist, bc)
+        if not getattr(rb, "success", False):
+            raise RuntimeError("AFT 优化未收敛")
         zb = (np.log(TGRID)[:, None] - rb.x[0] - rb.x[1] * bc["B0c"].values[None, :]) / np.exp(rb.x[2])
         Fb = sps.norm.cdf(zb) if dist == "lognormal" else 1 - np.exp(-np.exp(zb))
         ob = bc.sort_values("B0")
         Fb_ord = Fb[:, ob.index.values]  # bc 为 RangeIndex，按 BMI 排序取原位置
         ob0 = ob["B0"].values
-        # 用 bc 的顺序做 DP（bounds_of 依赖 B0v，局部重算）
         res = optimize_constraint(Fb_ord, gmax=g_chosen)
         cuts_b = res[g_chosen]["cuts"]
-        nb = len(ob0)
         bounds = [round((ob0[j - 1] + ob0[j]) / 2, 1) for (i, j) in cuts_b[:-1]]
         Psum_b = np.hstack([np.zeros((Fb_ord.shape[0], 1)), np.cumsum(Fb_ord, axis=1)])
+        feas_all = True
+        recs = []
         for gi, (i, j) in enumerate(cuts_b, 1):
             pbar = (Psum_b[:, j] - Psum_b[:, i]) / (j - i)
             k, feas = earliest_t(pbar)
-            stab.append({"b": b, "组": gi, "t*": float(TGRID[k]),
+            feas_all = feas_all and feas
+            recs.append({"b": b, "组": gi, "t*": float(TGRID[k]),
                          "bounds": ";".join(f"{x:.1f}" for x in bounds), "feas": feas})
+        for r_ in recs:
+            r_["方案整体可行"] = feas_all
+        stab += recs
+        scheme_ok.append(feas_all)
     except Exception:
-        pass
+        scheme_ok.append(False)
     if (b + 1) % 50 == 0:
         print(f"bootstrap {b + 1}/{B_BOOT}")
 stab_df = pd.DataFrame(stab)
@@ -403,13 +475,13 @@ if g_chosen == 2:
     log["稳定性_分界点90%区间"] = [round(float(np.quantile(bvals, 0.05)), 1),
                                     round(float(np.quantile(bvals, 0.95)), 1)]
 log["bootstrap成功次数"] = int(stab_df["b"].nunique())
-log["bootstrap约束满足率"] = round(float(stab_df["feas"].mean()), 4)
+log["bootstrap整套方案可行率"] = round(float(np.mean(scheme_ok)), 4)
 
 # 保存曲线供绘图
 np.save(os.path.join(OUT, "q2_grid_F.npy"), F_grid[:, oidx])
 np.save(os.path.join(OUT, "q2_grid_pGEE.npy"), P_grid[:, oidx])
-np.save(os.path.join(OUT, "q2_grid_p0.npy"), P0_ord)
-np.save(os.path.join(OUT, "q2_grid_p1.npy"), P1_ord)
+np.save(os.path.join(OUT, "q2_grid_plat.npy"), Plat_ord)
+np.save(os.path.join(OUT, "q2_grid_pobs.npy"), Pobs_ord)
 order[["pid", "B0"]].to_csv(os.path.join(OUT, "q2_order.csv"), index=False)
 json.dump({"cuts": [[int(i), int(j)] for i, j in cuts_main], "g_chosen": int(g_chosen)},
           open(os.path.join(OUT, "q2_cuts.json"), "w"))

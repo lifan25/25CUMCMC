@@ -83,8 +83,10 @@ def fit_aft(dist, data):
     best = None
     for a1_0 in [0.0, 0.02, 0.05]:
         r = opt.minimize(nll, [np.log(14.0), a1_0, np.log(0.35)], args=(data,), method="L-BFGS-B")
-        if best is None or r.fun < best.fun:
+        if r.success and np.isfinite(r.fun) and (best is None or r.fun < best.fun):
             best = r
+    if best is None:
+        raise RuntimeError(f"{dist} AFT 三组初值均未收敛")
     return best
 
 # 锚点 A：5 数据集均值恢复
@@ -353,7 +355,8 @@ sL = np.sqrt(s2_lat)
 for gi, (i, j) in enumerate(cuts_main, 1):
     t_star = float(main_df[(main_df["组"] == gi) & (main_df["方案"].str.contains("主方案"))]["推荐孕周"].iloc[0])
     kt = int(np.argmin(np.abs(TGRID - t_star)))
-    flips = [flip_prob(m_curve[kt, w], sL, S_HAT) for w in range(i, j)]
+    # cuts_main 是 BMI 排序后的区间，需映射回 m_curve 的原始列位置。
+    flips = [flip_prob(m_curve[kt, w], sL, S_HAT) for w in oidx[i:j]]
     err_rows.append({"组": gi, "口径": "当次误判率(联合正态,主方案时点)", "推荐孕周(Q1边际方案)": t_star,
                      "p(推荐时点)": round(float(np.mean(flips)), 4), "约束满足": ""})
 err_df = pd.DataFrame(err_rows)

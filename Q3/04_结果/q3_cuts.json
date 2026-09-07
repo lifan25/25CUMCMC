@@ -1,1 +1,1 @@
-{"cuts": [[0, 118], [118, 267]], "g_chosen": 2, "kept": [], "dist": "lognormal"}
+{"cuts": [[0, 51], [51, 267]], "g_chosen": 2, "lam": 10.0, "body_scheme": "B(\u4f53\u91cd+\u8eab\u9ad8)"}

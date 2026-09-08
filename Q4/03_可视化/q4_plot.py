@@ -71,4 +71,18 @@ for ax, k in zip(axes, LABELS):
     ax.axhline(-3, color=C_TH, lw=0.9, ls=":")
     ax.set(xticks=[0, 1], xticklabels=["阴性", "阳性"], ylabel="Z 值", title=f"{k}（虚线=±3）")
 save(fig, "raw_q4_z_by_label.png")
+
+# 图4 核心证据：消融对照（性能来自 GC/读段质量与人口学联合，而非 Z 值）
+abl = pd.read_csv(os.path.join(RES, "q4_ablation.csv"))
+fig, axes = plt.subplots(1, 3, figsize=(6.6, 2.9), sharey=True)
+set_names = ["A_对应Z单变量", "B_全部Z值", "C_Z+GC与读段质量", "D_完整18因素"]
+short = ["对应Z", "全部Z", "Z+GC/读段", "18因素"]
+for ax, k in zip(axes, LABELS):
+    sub = abl[abl["染色体"] == k].set_index("特征集").loc[set_names]
+    bars = ax.bar(short, sub["PR_AUC"], color=[C_PT, C_PT, CC[k], CC[k]], alpha=0.85, width=0.62)
+    ax.axhline(sub["PR_AUC"].iloc[0] * 0 + {"T13": 0.038, "T18": 0.076, "T21": 0.0215}[k],
+               color=C_TH, lw=0.8, ls="--")
+    ax.set(title=k, ylabel="PR-AUC" if k == "T13" else "")
+    ax.tick_params(axis="x", labelsize=6.5, rotation=20)
+save(fig, "result_q4_ablation.png")
 print("ALL DONE")

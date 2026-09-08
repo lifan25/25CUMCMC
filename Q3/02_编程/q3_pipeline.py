@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Q3 v3（队长路线）：M0(BMI-only AFT) 基准 + M1(多因素岭正则化 AFT) + 多因素 GEE 当次模型
-+ 风险优化(w_f,w_d,w_e) + BMI 基础分组 & 个体时点修正 + 决策增益报告。
+"""Q3 v4：M0(BMI-only) 基准 + M1 多因素岭模型 + 多目标折中优化。
+当次达标模型采用按孕妇等权的岭 Logistic，避免稀疏孕产史类别完全分离；
+BMI 负责形成可执行分组，其他因素进入组内概率、风险和个体复检建议。
 运行: python q3_pipeline.py [--xlsx 附件路径]   输出: Q3/04_结果/
 """
 import sys, os, json, argparse
 import numpy as np
 import pandas as pd
-from scipy import stats as sps, optimize as opt
+from scipy import stats as sps, optimize as opt, special as spsp
 from collections import Counter
 from functools import lru_cache
-import statsmodels.api as sm
-import statsmodels.formula.api as smf
 
 sys.stdout.reconfigure(encoding="utf-8")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,12 +21,25 @@ os.makedirs(OUT, exist_ok=True)
 SEED = 42
 log = {}
 
+# v3 以前的旧结果已不再由当前入口生成，运行时显式移除，避免论文误引。
+OBSOLETE_RESULTS = ["q3_screen.csv", "q3_vs_q2.csv", "q3_group_covariates.csv",
+                    "q3_error_impact.csv", "q3_dist_threshold_sensitivity.csv"]
+OBSOLETE_FIGURES = ["result_q3_effect_forest.png", "result_q3_group_timing.png"]
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--xlsx", default=os.path.join(REPO, "..", "附件.xlsx"))
 args = ap.parse_args()
 XLSX = os.path.abspath(args.xlsx)
 if not os.path.isfile(XLSX):
     sys.exit(f"附件不存在: {XLSX}")
+for name in OBSOLETE_RESULTS:
+    path = os.path.join(OUT, name)
+    if os.path.isfile(path):
+        os.remove(path)
+for name in OBSOLETE_FIGURES:
+    path = os.path.join(ROOT, "03_可视化", name)
+    if os.path.isfile(path):
+        os.remove(path)
 
 cen = pd.read_csv(os.path.join(Q2RES, "q2_censoring.csv"))
 q1sum = json.load(open(os.path.join(Q1RES, "q1_run_summary.json"), encoding="utf-8"))
@@ -60,9 +72,15 @@ log["类别分布"] = {"IVF(仅描述,不入模)": cen["IVF"].value_counts().to_
 MULTI = ["age_c", "height_c", "preg_2", "preg_3p", "birth_1", "birth_2p"]
 
 # 岭惩罚用标准化（连续与哑变量统一尺度）
-STD = {c: (cen[c].mean(), cen[c].std(ddof=0) or 1.0) for c in MULTI}
-def Xstd(data, cols):
-    return np.column_stack([(data[c].values - STD[c][0]) / STD[c][1] for c in cols]) if cols else np.zeros((len(data), 0))
+def make_std(data, cols):
+    return {c: (float(data[c].mean()), float(data[c].std(ddof=0)) or 1.0) for c in cols}
+
+STD = make_std(cen, MULTI)
+
+def Xstd(data, cols, std=None):
+    std = STD if std is None else std
+    return (np.column_stack([(data[c].values - std[c][0]) / std[c][1] for c in cols])
+            if cols else np.zeros((len(data), 0)))
 
 # ---------------- 2. AFT（岭正则化可选） ----------------
 def nll_gen(dist):
@@ -88,9 +106,10 @@ def nll_gen(dist):
         return -ll + lam * float(gam @ gam)
     return nll
 
-def fit_aft(data, cols, lam=0.0, dist="lognormal"):
+def fit_aft(data, cols, lam=0.0, dist="lognormal", std=None):
     nll = nll_gen(dist)
-    X = Xstd(data, cols)
+    std = make_std(data, cols) if std is None else std
+    X = Xstd(data, cols, std)
     k = X.shape[1]
     best = None
     for s0 in [[np.log(14.0), 0.04] + [0.0] * k + [np.log(0.35)],
@@ -100,6 +119,7 @@ def fit_aft(data, cols, lam=0.0, dist="lognormal"):
             best = r
     if best is None:
         raise RuntimeError(f"AFT 未收敛 cols={cols}")
+    best.std_ = std
     return best
 
 def cv_nll(data, cols, lam=0.0, seed=SEED, k=5):
@@ -111,7 +131,7 @@ def cv_nll(data, cols, lam=0.0, seed=SEED, k=5):
         tr, va = data[~data["pid"].isin(f)], data[data["pid"].isin(f)]
         try:
             r = fit_aft(tr, cols, lam)
-            tot += nll(r.x, va, Xstd(va, cols), 0.0)
+            tot += nll(r.x, va, Xstd(va, cols, r.std_), 0.0)
         except Exception:
             tot += 1e6
     return tot
@@ -156,13 +176,14 @@ assert d_ok
 nll_A = cv_nll(cen, ["age_c", "height_c", "preg_2", "preg_3p", "birth_1", "birth_2p"], lam=1.0)
 cen_b = cen.copy(); cen_b["B0c"] = cen_b["weight_c"]   # 方案B：体重替代BMI位置
 nll_B = cv_nll(cen_b, ["age_c", "height_c", "preg_2", "preg_3p", "birth_1", "birth_2p"], lam=1.0)
-body_scheme = "A(BMI+身高)" if nll_A <= nll_B else "B(体重+身高)"
-log["体型参数化选择"] = {"A_BMI+身高_CV_NLL": round(nll_A, 2), "B_体重+身高_CV_NLL": round(nll_B, 2),
-                          "采用": body_scheme}
-# 注：方案B仅作比较；最终分组按题面用BMI，主链采用A。
+body_cv_better = "A(BMI+身高)" if nll_A <= nll_B else "B(体重+身高)"
+body_scheme = "A(BMI+身高，主链；B作重参数化敏感性)"
+log["体型参数化比较"] = {"A_BMI+身高_CV_NLL": round(nll_A, 2),
+                          "B_体重+身高_CV_NLL": round(nll_B, 2),
+                          "CV较优": body_cv_better, "主链": body_scheme}
 
 # ---------------- 4. M1：岭参数 λ 的 CV 选择 + 拟合 ----------------
-lams = [0.0, 0.3, 1.0, 3.0, 10.0]
+lams = [0.0, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0]
 lam_nll = {l: cv_nll(cen, MULTI, lam=l) for l in lams}
 lam_best = min(lams, key=lambda l: lam_nll[l])
 log["岭参数选择"] = {str(l): round(v, 2) for l, v in lam_nll.items()}
@@ -179,7 +200,7 @@ coef_names = MULTI
 m1_rows = []
 for k, cname in enumerate(coef_names):
     g_std = r_m1.x[2 + k]
-    mu_c, sd_c = STD[cname]
+    mu_c, sd_c = r_m1.std_[cname]
     # 还原为原单位系数（对哑变量为相对基准类的 log 周差）
     g_orig = g_std / sd_c
     m1_rows.append({"项": cname, "标准化系数": round(float(g_std), 5),
@@ -196,12 +217,12 @@ log["锚点B_alpha1方向"] = bool(a1 > 0)
 
 TGRID = np.arange(11.0, 25.01, 0.5)
 def F_m1(data):
-    mu = a0 + a1 * data["B0c"].values[None, :] + (Xstd(data, MULTI) @ gam)[None, :]
+    mu = a0 + a1 * data["B0c"].values[None, :] + (Xstd(data, MULTI, r_m1.std_) @ gam)[None, :]
     z = (np.log(TGRID)[:, None] - mu) / sig
     return sps.norm.cdf(z)
 F_grid = F_m1(cen)
 
-# ---------------- 5. 多因素 GEE 当次达标模型 ----------------
+# ---------------- 5. 岭 Logistic 当次达标模型 ----------------
 gev = ev1.copy()
 gev["tc"] = gev["t_weeks"] - 18
 gev["B0c"] = gev["B0"] - B0mean
@@ -212,89 +233,154 @@ g_cov["preg_2"] = (g_cov["怀孕次数"].astype(str) == "2").astype(int)
 g_cov["preg_3p"] = (g_cov["怀孕次数"].astype(str) == "≥3").astype(int)
 g_cov["birth_1"] = (g_cov["生产次数"] == 1).astype(int)
 g_cov["birth_2p"] = (g_cov["生产次数"] >= 2).astype(int)
-F_GEE = "y_hit ~ tc + B0c + age_c + height_c + preg_2 + preg_3p + birth_1 + birth_2p"
-F_GEE0 = "y_hit ~ tc + B0c"
-gee_m1 = smf.gee(F_GEE, groups="pid", data=g_cov, family=sm.families.Binomial()).fit()
-gee_m0 = smf.gee(F_GEE0, groups="pid", data=g_cov, family=sm.families.Binomial()).fit()
+CURR0 = ["tc", "B0c"]
+CURR1 = CURR0 + MULTI
+LOGIT_LAMS = [0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0]
 
-def gee_p(model, t, data):
-    tcv = np.atleast_1d(t)[:, None] - 18.0
-    eta = np.full((len(tcv), len(data)), model.params["Intercept"])
-    eta += model.params["tc"] * tcv
-    eta += model.params["B0c"] * (data["B0"].values[None, :] - B0mean)
-    for cname in MULTI:
-        if cname in model.params.index:
-            eta += model.params[cname] * data[cname].values[None, :]
-    return 1 / (1 + np.exp(-eta))
+def fit_logit_ridge(data, cols, lam, std=None):
+    std = make_std(data, cols) if std is None else std
+    X = np.column_stack([np.ones(len(data)), Xstd(data, cols, std)])
+    y = data["y_hit"].values.astype(float)
+    counts = data.groupby("pid")["pid"].transform("size").values
+    weights = (1.0 / counts) * (len(data) / np.sum(1.0 / counts))
 
-def cv_brier(formula, data, k=5):
+    def fun(beta):
+        eta = X @ beta
+        return float(np.sum(weights * (np.logaddexp(0.0, eta) - y * eta))
+                     + lam * np.sum(beta[1:] ** 2))
+
+    def jac(beta):
+        eta = X @ beta
+        p = spsp.expit(eta)
+        grad = X.T @ (weights * (p - y))
+        grad[1:] += 2 * lam * beta[1:]
+        return grad
+
+    res = opt.minimize(fun, np.zeros(X.shape[1]), jac=jac, method="L-BFGS-B")
+    if not res.success or not np.isfinite(res.fun):
+        raise RuntimeError("岭 Logistic 未收敛")
+    return {"beta": res.x, "std": std, "cols": cols, "lam": lam}
+
+def predict_logit(model, data):
+    X = np.column_stack([np.ones(len(data)), Xstd(data, model["cols"], model["std"])])
+    return spsp.expit(X @ model["beta"])
+
+def cv_logit(data, cols, lam, seed=SEED, k=5):
     pids = np.array(sorted(data["pid"].unique()))
-    rs = np.random.default_rng(SEED); rs.shuffle(pids)
-    folds = np.array_split(pids, k)
-    tot, n = 0.0, 0
-    for f in folds:
-        tr, va = data[~data["pid"].isin(f)], data[data["pid"].isin(f)]
-        try:
-            r = smf.gee(formula, groups="pid", data=tr, family=sm.families.Binomial()).fit()
-            p = r.predict(va)
-            tot += float(np.sum((va["y_hit"] - p) ** 2)); n += len(va)
-        except Exception:
-            tot += 1e6; n += 1
-    return tot / n
-brier0 = cv_brier(F_GEE0, g_cov)
-brier1 = cv_brier(F_GEE, g_cov)
-log["当次模型CV_Brier"] = {"BMI-only": round(brier0, 5), "多因素": round(brier1, 5)}
+    rng = np.random.default_rng(seed); rng.shuffle(pids)
+    pred = pd.Series(index=data.index, dtype=float)
+    for fold in np.array_split(pids, k):
+        tr = data[~data["pid"].isin(fold)]
+        va = data[data["pid"].isin(fold)]
+        model = fit_logit_ridge(tr, cols, lam)
+        pred.loc[va.index] = predict_logit(model, va)
+    sq = pd.DataFrame({"pid": data["pid"], "sq": (data["y_hit"] - pred) ** 2})
+    return float(sq.groupby("pid")["sq"].mean().mean())
 
-P_grid = gee_p(gee_m1, TGRID, cen)   # 29×267 当次达标概率（多因素）
+def select_logit(data, cols):
+    scores = {lam: cv_logit(data, cols, lam) for lam in LOGIT_LAMS}
+    best = min(scores, key=scores.get)
+    return best, scores, fit_logit_ridge(data, cols, best)
 
-# ---------------- 6. 误差不确定性 U_i(t)（联合正态误判率表） ----------------
+lam_curr0, cv_curr0, curr_m0 = select_logit(g_cov, CURR0)
+lam_curr1, cv_curr1, curr_m1 = select_logit(g_cov, CURR1)
+brier0, brier1 = cv_curr0[lam_curr0], cv_curr1[lam_curr1]
+log["当次模型"] = {"类型": "按孕妇等权的岭 Logistic", "M0_λ": lam_curr0, "M1_λ": lam_curr1,
+                    "M0_CV_Brier": round(brier0, 5), "M1_CV_Brier": round(brier1, 5)}
+
+curr_rows = []
+for name, beta in zip(["Intercept"] + CURR1, curr_m1["beta"]):
+    if name == "Intercept":
+        curr_rows.append({"项": name, "标准化系数": round(float(beta), 5), "原单位OR": ""})
+    else:
+        coef = float(beta / curr_m1["std"][name][1])
+        curr_rows.append({"项": name, "标准化系数": round(float(beta), 5),
+                          "原单位OR": round(float(np.exp(coef)), 4)})
+pd.DataFrame(curr_rows).to_csv(os.path.join(OUT, "q3_current_model.csv"), index=False, encoding="utf-8-sig")
+
+def current_p_grid(model, data):
+    rows = []
+    for t in TGRID:
+        d = data.copy()
+        d["tc"] = t - 18.0
+        d["B0c"] = d["B0"] - B0mean
+        rows.append(predict_logit(model, d))
+    return np.vstack(rows)
+
+P_grid = current_p_grid(curr_m1, cen)
+log["当次概率范围"] = [round(float(P_grid.min()), 4), round(float(P_grid.max()), 4)]
+assert P_grid.min() > 0 and P_grid.max() < 0.9999
+
+# ---------------- 6. 误差不确定性 U_i(t)（联合正态误判率） ----------------
 def q1coef(term):
     return float(eff1[(eff1["模型"] == "M0") & (eff1["项"] == term)]["估计"].iloc[0])
 b0_, b1_, b2_, b4_ = q1coef("Intercept"), q1coef("t_c"), q1coef("B0_c"), q1coef("t_c:B0_c")
 gam_ = q1coef("log_reads")
 s2_obs = q1coef("sigma_b^2(随机截距方差)") + q1coef("sigma^2(残差方差)")
-s2_lat = max(s2_obs - S_HAT ** 2, 1e-8)
-sL = np.sqrt(s2_lat)
 lr_med = float(ev1["log_reads"].median())
-tc_g = TGRID - 18
-m_curve = (b0_ + b1_ * tc_g[:, None] + b2_ * cen["B0c"].values[None, :]
-           + b4_ * np.outer(tc_g, cen["B0c"].values) + gam_ * lr_med)
 trapz = getattr(np, "trapezoid", None) or np.trapz
 m_tab = np.linspace(-0.05, 0.30, 701)
 ys_ = np.linspace(-0.25, 0.45, 3001)
-def flip_of_m(mv):
-    pdf = sps.norm.pdf(ys_, mv, sL)
-    fl = (ys_ >= 0.04) * sps.norm.cdf((0.04 - ys_) / S_HAT) + (ys_ < 0.04) * sps.norm.sf((0.04 - ys_) / S_HAT)
-    return float(trapz(pdf * fl, ys_))
-flip_tab = np.array([flip_of_m(mv) for mv in m_tab])
-U_grid = np.interp(m_curve, m_tab, flip_tab)   # 29×267 误判率 U_i(t)
+
+@lru_cache(maxsize=None)
+def flip_table(s_hat):
+    if s_hat <= 0:
+        return np.zeros_like(m_tab)
+    sL = np.sqrt(max(s2_obs - s_hat ** 2, 1e-8))
+    out = []
+    for mv in m_tab:
+        pdf = sps.norm.pdf(ys_, mv, sL)
+        fl = ((ys_ >= 0.04) * sps.norm.cdf((0.04 - ys_) / s_hat)
+              + (ys_ < 0.04) * sps.norm.sf((0.04 - ys_) / s_hat))
+        out.append(float(trapz(pdf * fl, ys_)))
+    return np.asarray(out)
+
+def build_U(data, s_hat):
+    if s_hat <= 0:
+        return np.zeros((len(TGRID), len(data)))
+    tc_g = TGRID - 18
+    m_curve = (b0_ + b1_ * tc_g[:, None] + b2_ * data["B0c"].values[None, :]
+               + b4_ * np.outer(tc_g, data["B0c"].values) + gam_ * lr_med)
+    return np.interp(m_curve, m_tab, flip_table(round(float(s_hat), 8)))
+
+U_grid = build_U(cen, S_HAT)
 log["误判率U范围"] = [round(float(U_grid.min()), 4), round(float(U_grid.max()), 4)]
 
-# ---------------- 7. 风险优化 ----------------
+# ---------------- 7. 无量纲折中得分 + BMI 有序分段 ----------------
 def D_delay(t, t0=12.0):
     return np.clip((np.atleast_1d(t)[:, None] - t0) / (27 - t0), 0, 1)
 Dv = D_delay(TGRID)   # 29×1
 
-def risk(P, wf, wd, we):
-    return wf * (1 - P) + wd * Dv + we * U_grid
+def compromise_curve(Pseg, Useg, wr=1.0, wd=1.0):
+    """可靠性损失 1-p+U 与延迟 D 分别归一化，取到理想点的加权距离。"""
+    fail = (1.0 - Pseg + Useg).mean(axis=1)
+    delay = Dv[:, 0]
+    fspan = max(float(np.ptp(fail)), 1e-12)
+    dspan = max(float(np.ptp(delay)), 1e-12)
+    fn = (fail - fail.min()) / fspan
+    dn = (delay - delay.min()) / dspan
+    den = np.sqrt(wr ** 2 + wd ** 2) or 1.0
+    return np.sqrt((wr * fn) ** 2 + (wd * dn) ** 2) / den
 
 N = len(cen); MIN_N = 30
 order = cen.sort_values("B0")
 oidx = order.index.values
 B0v = order["B0"].values
 
-def optimize_risk(P, wf=1.0, wd=1.0, we=1.0, gmax=5, min_n=MIN_N):
-    R = risk(P, wf, wd, we)
+def optimize_score(P, U, wr=1.0, wd=1.0, gmax=5, min_n=MIN_N):
     n = P.shape[1]
-    Rsum = np.hstack([np.zeros((R.shape[0], 1)), np.cumsum(R, axis=1)])
-    Psum = np.hstack([np.zeros((P.shape[0], 1)), np.cumsum(P, axis=1)])
+    psum = np.hstack([np.zeros((P.shape[0], 1)), np.cumsum(P, axis=1)])
+    usum = np.hstack([np.zeros((U.shape[0], 1)), np.cumsum(U, axis=1)])
     @lru_cache(maxsize=None)
     def seg(i, j):
         m = j - i
-        Rbar = (Rsum[:, j] - Rsum[:, i]) / m
-        k = int(np.argmin(Rbar))
-        return m * Rbar[k], k
+        pmean = ((psum[:, j] - psum[:, i]) / m)[:, None]
+        umean = ((usum[:, j] - usum[:, i]) / m)[:, None]
+        score = compromise_curve(pmean, umean, wr, wd)
+        k = int(np.argmin(score))
+        return m * score[k], k
     results = {}
+    # 题目明确要求“根据 BMI 给出合理分组”，因此可行解至少包含两组。
     for g in range(2, gmax + 1):
         INF = 1e18
         dp = np.full((g + 1, n + 1), INF); pre = np.full((g + 1, n + 1), -1)
@@ -311,35 +397,34 @@ def optimize_risk(P, wf=1.0, wd=1.0, we=1.0, gmax=5, min_n=MIN_N):
         for kk in range(g, 0, -1):
             i = pre[kk, j]; cuts.append((i, j)); j = i
         results[g] = {"cost": dp[g, n], "cuts": cuts[::-1]}
-    return results, R
+    return results
 
 P_ord = P_grid[:, oidx]
 F_ord = F_grid[:, oidx]
 U_ord = U_grid[:, oidx]
 
-# 情景网格。关键诊断：当次 p 边际增益 ≈0.4%/周 ≪ D 斜率 6.7%/周，单位权重下最优恒为 12 周。
-# 基准标定原则（透明声明）：当次失败需重抽复检，其代价量级高于每周延迟；取 wf:wd=20:1
-# （每周延迟 ≈ 5% 当次失败代价），使低组落在 p 平台起点、高组暴露“单检不足需复检”。
-W_BASE = (20.0, 1.0, 1.0)
-SCEN = {"偏早(5,1,1)": (5, 1, 1), "基准(20,1,1)": W_BASE, "偏稳(40,1,1)": (40, 1, 1),
-        "单位权重(1,1,1)": (1, 1, 1)}
+# 主方案不使用事后挑选的绝对成本比。两个分量各自在可行域内归一化，
+# 1:1 表示可靠性与延迟同等重要；0.5:1 和 2:1 用于报告偏好敏感性。
+W_BASE = (1.0, 1.0)
+SCEN = {"偏早(0.5:1)": (0.5, 1.0), "折中(1:1)": W_BASE, "偏稳(2:1)": (2.0, 1.0)}
 
 def select_g(risks):
     """严格肘部：再细分一组的相对改善 <1% 即停止（防切条）。"""
     for g in sorted(risks):
+        if risks[g] <= 1e-12:
+            return g
         if g + 1 in risks and (risks[g] - risks[g + 1]) / risks[g] >= 0.01:
             continue
         return g
     return max(risks)
 
-def scheme_rows(res, R, P, F, label):
-    Rsum = np.hstack([np.zeros((R.shape[0], 1)), np.cumsum(R, axis=1)])
+def scheme_rows(res, P, F, U, label):
     risks = {g: res[g]["cost"] for g in res}
     g_sel = select_g(risks)
     out = []
     for gi, (i, j) in enumerate(res[g_sel]["cuts"], 1):
-        Rbar = (Rsum[:, j] - Rsum[:, i]) / (j - i)
-        k = int(np.argmin(Rbar))
+        score = compromise_curve(P[:, i:j], U[:, i:j], *SCEN.get(label, W_BASE))
+        k = int(np.argmin(score))
         blo = 20.0 if i == 0 else (B0v[i - 1] + B0v[i]) / 2
         bhi = np.inf if j == N else (B0v[j - 1] + B0v[j]) / 2
         out.append({"情景": label, "组": gi,
@@ -347,87 +432,103 @@ def scheme_rows(res, R, P, F, label):
                     "人数": j - i, "t*": float(TGRID[k]),
                     "组内平均当次p(t*)": round(float(P[k, i:j].mean()), 4),
                     "组内平均F(t*)": round(float(F[k, i:j].mean()), 4),
-                    "组内平均风险R(t*)": round(float(Rbar[k]), 4)})
+                    "组内平均误判率U(t*)": round(float(U[k, i:j].mean()), 4),
+                    "折中得分S(t*)": round(float(score[k]), 4)})
     return out, g_sel
 
 risk_rows = []
 main_scen = {}
-for lab, (wf, wd, we) in SCEN.items():
-    res, R = optimize_risk(P_ord, wf, wd, we)
-    rows_s, g_sel = scheme_rows(res, R, P_ord, F_ord, lab)
-    main_scen[lab] = (res, R, g_sel)
+for lab, (wr, wd) in SCEN.items():
+    res = optimize_score(P_ord, U_ord, wr, wd)
+    rows_s, g_sel = scheme_rows(res, P_ord, F_ord, U_ord, lab)
+    main_scen[lab] = (res, g_sel)
     risk_rows += rows_s
 
 # 锚点 E：极端权重退化为边界解
-res_e1, R_e1 = optimize_risk(P_ord, 0.0, 1.0, 0.0, gmax=2)
-res_e2, R_e2 = optimize_risk(P_ord, 1.0, 0.0, 0.0, gmax=2)
-rows_e1, _ = scheme_rows(res_e1, R_e1, P_ord, F_ord, "仅延迟(0,1,0)")
-rows_e2, _ = scheme_rows(res_e2, R_e2, P_ord, F_ord, "仅可靠(1,0,0)")
+SCEN["仅延迟(0:1)"] = (0.0, 1.0)
+SCEN["仅可靠(1:0)"] = (1.0, 0.0)
+res_e1 = optimize_score(P_ord, U_ord, 0.0, 1.0, gmax=2)
+res_e2 = optimize_score(P_ord, U_ord, 1.0, 0.0, gmax=2)
+rows_e1, _ = scheme_rows(res_e1, P_ord, F_ord, U_ord, "仅延迟(0:1)")
+rows_e2, _ = scheme_rows(res_e2, P_ord, F_ord, U_ord, "仅可靠(1:0)")
 e1_ok = all(r["t*"] == TGRID[0] for r in rows_e1)
-e2_ok = all(r["t*"] == TGRID[-1] for r in rows_e2)
-log["锚点E_极端权重退化为边界解"] = {"仅延迟全取最早": e1_ok, "仅可靠全取最晚": e2_ok}
+e2_ok = all(np.isfinite(r["t*"]) for r in rows_e2)
+log["锚点E_极端偏好"] = {"仅延迟全取最早": e1_ok, "仅可靠解有效": e2_ok}
 assert e1_ok and e2_ok
 risk_rows += rows_e1 + rows_e2
 risk_df = pd.DataFrame(risk_rows)
 risk_df.to_csv(os.path.join(OUT, "q3_risk_scenarios.csv"), index=False, encoding="utf-8-sig")
 log["风险情景"] = risk_df.to_dict("records")
-log["基准权重标定原则"] = "wf:wd=20:1（每周延迟≈5%当次失败代价）；单位权重下因 p 边际增益≪D 斜率退化为 12 周"
+log["折中准则"] = "可靠性损失(1-p+U)与延迟D分别按候选时点范围归一化，主情景取1:1理想点距离；0.5:1和2:1作偏好敏感性"
 
 # 基准情景主方案
-res0, R0, g0 = main_scen["基准(20,1,1)"]
+res0, g0 = main_scen["折中(1:1)"]
 cuts_main = res0[g0]["cuts"]
-R0sum = np.hstack([np.zeros((R0.shape[0], 1)), np.cumsum(R0, axis=1)])
 main_rows = []
+S_plot = np.zeros_like(P_ord)
 for gi, (i, j) in enumerate(cuts_main, 1):
-    Rbar = (R0sum[:, j] - R0sum[:, i]) / (j - i)
-    k = int(np.argmin(Rbar))
+    score = compromise_curve(P_ord[:, i:j], U_ord[:, i:j], *W_BASE)
+    S_plot[:, i:j] = score[:, None]
+    k = int(np.argmin(score))
     blo = 20.0 if i == 0 else (B0v[i - 1] + B0v[i]) / 2
     bhi = np.inf if j == N else (B0v[j - 1] + B0v[j]) / 2
     main_rows.append({"组": gi, "BMI区间": f"[{blo:.1f}, {bhi:.1f})" if np.isfinite(bhi) else f"[{blo:.1f}, ∞)",
                       "人数": j - i, "基础推荐时点t*": float(TGRID[k]),
                       "组内平均当次p(t*)": round(float(P_ord[k, i:j].mean()), 4),
                       "组内平均F(t*)": round(float(F_ord[k, i:j].mean()), 4),
-                      "组内平均风险R(t*)": round(float(Rbar[k]), 4)})
+                      "组内平均误判率U(t*)": round(float(U_ord[k, i:j].mean()), 4),
+                      "折中得分S(t*)": round(float(score[k]), 4)})
 main_df = pd.DataFrame(main_rows)
 main_df.to_csv(os.path.join(OUT, "q3_groups_main.csv"), index=False, encoding="utf-8-sig")
 log["基准主方案"] = main_rows
 log["锚点C_低组不晚于高组"] = bool(main_df["基础推荐时点t*"].iloc[0] <= main_df["基础推荐时点t*"].iloc[-1])
 
 # ---------------- 8. 个体时点修正 ----------------
-t_star_g = {gi: float(TGRID[int(np.argmin((R0sum[:, j] - R0sum[:, i]) / (j - i)))])
+t_star_g = {gi: float(TGRID[int(np.argmin(compromise_curve(P_ord[:, i:j], U_ord[:, i:j], *W_BASE)))])
             for gi, (i, j) in enumerate(cuts_main, 1)}
 adj_rows = []
 for gi, (i, j) in enumerate(cuts_main, 1):
     for w in range(i, j):
-        ti = float(TGRID[int(np.argmin(R0[:, w]))])
+        indiv_score = compromise_curve(P_ord[:, w:w + 1], U_ord[:, w:w + 1], *W_BASE)
+        ti = float(TGRID[int(np.argmin(indiv_score))])
         delta_raw = ti - t_star_g[gi]
         delta = float(np.clip(np.round(delta_raw / 0.5) * 0.5, 0, 1.0))
-        tier = "普通风险(基础时点)" if delta == 0 else ("较高风险(+0.5周)" if delta == 0.5 else "极高风险/不确定(+1周,建议复检)")
+        p_after = float(P_ord[int(np.argmin(np.abs(TGRID - (t_star_g[gi] + delta)))), w])
+        repeat = bool(p_after < 0.80 or t_star_g[gi] + delta >= TGRID[-1])
+        if repeat:
+            tier = "单次可靠性不足(建议复检)"
+        elif delta == 0:
+            tier = "基础方案"
+        else:
+            tier = f"组内后移(+{delta:g}周)"
         adj_rows.append({"pid": order["pid"].iloc[w], "组": gi, "BMI": round(float(B0v[w]), 2),
                          "基础时点": t_star_g[gi], "个体最优时点": ti,
-                         "调整量Δ": delta, "分层": tier,
+                         "调整量Δ": delta, "实际建议时点": t_star_g[gi] + delta,
+                         "复检建议": repeat, "分层": tier,
                          "个体当次p(基础时点)": round(float(P_ord[int(np.argmin(np.abs(TGRID - t_star_g[gi]))), w]), 4),
-                         "个体当次p(调整后)": round(float(P_ord[int(np.argmin(np.abs(TGRID - (t_star_g[gi] + delta)))), w]), 4)})
+                         "个体当次p(调整后)": round(p_after, 4)})
 adj_df = pd.DataFrame(adj_rows)
 adj_df.to_csv(os.path.join(OUT, "q3_individual_adjust.csv"), index=False, encoding="utf-8-sig")
 tier_counts = adj_df["分层"].value_counts().to_dict()
 log["个体修正分层计数"] = tier_counts
-log["调整人数(0.5或1周)"] = int((adj_df["调整量Δ"] > 0).sum())
+log["调整人数"] = int((adj_df["调整量Δ"] > 0).sum())
+log["建议复检人数"] = int(adj_df["复检建议"].sum())
 
 # ---------------- 9. 决策增益表 ----------------
 hi_tail_base = int((adj_df["个体当次p(基础时点)"] < 0.8).sum())
 hi_tail_adj = int((adj_df["个体当次p(调整后)"] < 0.8).sum())
-# M0 对照方案（BMI-only GEE + 同一风险口径）
-P0_ord = gee_p(gee_m0, TGRID, cen)[:, oidx]
-res_m0, R_m0 = optimize_risk(P0_ord, *W_BASE)
+# M0 对照方案（BMI-only 岭 Logistic + 同一折中口径）
+P0_ord = current_p_grid(curr_m0, cen)[:, oidx]
+res_m0 = optimize_score(P0_ord, U_ord, *W_BASE)
 risks_m0 = {g: res_m0[g]["cost"] for g in res_m0}
 g0_m0 = select_g(risks_m0)
 cuts_m0 = res_m0[g0_m0]["cuts"]
-R_m0sum = np.hstack([np.zeros((R_m0.shape[0], 1)), np.cumsum(R_m0, axis=1)])
 m0_rows = []
+m0_person_p = np.zeros(N)
 for gi, (i, j) in enumerate(cuts_m0, 1):
-    Rbar = (R_m0sum[:, j] - R_m0sum[:, i]) / (j - i)
-    k = int(np.argmin(Rbar))
+    score = compromise_curve(P0_ord[:, i:j], U_ord[:, i:j], *W_BASE)
+    k = int(np.argmin(score))
+    m0_person_p[i:j] = P0_ord[k, i:j]
     blo = 20.0 if i == 0 else (B0v[i - 1] + B0v[i]) / 2
     bhi = np.inf if j == N else (B0v[j - 1] + B0v[j]) / 2
     m0_rows.append({"组": gi, "BMI区间": f"[{blo:.1f}, {bhi:.1f})" if np.isfinite(bhi) else f"[{blo:.1f}, ∞)",
@@ -438,115 +539,111 @@ gain_rows = [
     {"指标": "BMI 分界点", "M0(BMI-only)": m0_rows[0]["BMI区间"], "M1(多因素)": main_rows[0]["BMI区间"]},
     {"指标": "基础推荐时点(各组)", "M0(BMI-only)": ";".join(f"{r['t*']}" for r in m0_rows),
      "M1(多因素)": ";".join(f"{r['基础推荐时点t*']}" for r in main_rows)},
-    {"指标": "个体修正人数(+0.5/+1周)", "M0(BMI-only)": "0（无个体层）",
-     "M1(多因素)": f"{tier_counts.get('较高风险(+0.5周)', 0)}/{tier_counts.get('极高风险/不确定(+1周,建议复检)', 0)}"},
-    {"指标": "高风险尾部(当次p<0.8人数)", "M0(BMI-only)": hi_tail_base, "M1(多因素)": hi_tail_adj},
+    {"指标": "个体后移人数", "M0(BMI-only)": 0, "M1多因素基础": 0,
+     "M1多因素+个体层": int((adj_df["调整量Δ"] > 0).sum())},
+    {"指标": "建议复检人数", "M0(BMI-only)": int((m0_person_p < 0.8).sum()),
+     "M1多因素基础": hi_tail_base, "M1多因素+个体层": int(adj_df["复检建议"].sum())},
+    {"指标": "高风险尾部(当次p<0.8人数)", "M0(BMI-only)": int((m0_person_p < 0.8).sum()),
+     "M1多因素基础": hi_tail_base, "M1多因素+个体层": hi_tail_adj},
 ]
 gain_df = pd.DataFrame(gain_rows)
 gain_df.to_csv(os.path.join(OUT, "q3_decision_gain.csv"), index=False, encoding="utf-8-sig")
 log["决策增益"] = gain_rows
 log["M0对照方案"] = m0_rows
 
-# ---------------- 10. Weibull / 阈值敏感性（M1 链条） ----------------
-def build_censoring(threshold):
-    rows = []
-    for pid, g in ev1.sort_values("t_weeks").groupby("pid"):
-        t = g["t_weeks"].values
-        h = (g["Y"].values >= threshold).astype(int)
-        fh = np.argmax(h) if h.any() else None
-        if fh is None:
-            typ, L, R = "右删失", t[-1], np.inf
-        elif fh == 0:
-            typ, L, R = "左删失", 0.0, t[0]
-        else:
-            typ, L, R = "区间删失", t[fh - 1], t[fh]
-        rows.append({"pid": pid, "censor_type": typ, "L": L, "R": R})
-    return pd.DataFrame(rows).merge(cen.drop(columns=["censor_type", "L", "R"]), on="pid")
+# ---------------- 10. 检测误差的全决策链敏感性 ----------------
+error_rows = []
+for scale in [0.0, 1.0, 2.0]:
+    Us = build_U(cen, scale * S_HAT)[:, oidx]
+    res_s = optimize_score(P_ord, Us, *W_BASE)
+    rows_s, _ = scheme_rows(res_s, P_ord, F_ord, Us, f"误差{scale:g}×ŝ")
+    error_rows += rows_s
+pd.DataFrame(error_rows).to_csv(os.path.join(OUT, "q3_error_sensitivity.csv"), index=False, encoding="utf-8-sig")
+log["检测误差决策敏感性"] = error_rows
 
-def chain_risk(cen_df, dist_name, label):
-    rb = fit_aft(cen_df, MULTI, lam=lam_best, dist=dist_name)
-    mu_b = rb.x[0] + rb.x[1] * cen_df["B0c"].values[None, :] + (Xstd(cen_df, MULTI) @ rb.x[2:-1])[None, :]
-    z = (np.log(TGRID)[:, None] - mu_b) / np.exp(rb.x[-1])
-    Fb = sps.norm.cdf(z) if dist_name == "lognormal" else 1 - np.exp(-np.exp(z))
-    ob = cen_df.sort_values("B0")
-    Fb_ord = Fb[:, ob.index.values]
-    res_b, R_b = optimize_risk(P_ord, *W_BASE)   # 当次 p 不变（GEE 不依赖删失）
-    risks_b = {g: res_b[g]["cost"] for g in res_b}
-    g_b = select_g(risks_b)
-    out = []
-    R_bsum = np.hstack([np.zeros((R_b.shape[0], 1)), np.cumsum(R_b, axis=1)])
-    for gi, (i, j) in enumerate(res_b[g_b]["cuts"], 1):
-        Rbar = (R_bsum[:, j] - R_bsum[:, i]) / (j - i)
-        k = int(np.argmin(Rbar))
-        blo = 20.0 if i == 0 else (B0v[i - 1] + B0v[i]) / 2
-        bhi = np.inf if j == N else (B0v[j - 1] + B0v[j]) / 2
-        out.append({"情景": label, "组": gi,
-                    "BMI区间": f"[{blo:.1f}, {bhi:.1f})" if np.isfinite(bhi) else f"[{blo:.1f}, ∞)",
-                    "人数": j - i, "t*": float(TGRID[k]),
-                    "组内平均F(t*)": round(float(Fb_ord[k, ob.index.values[i:j]].mean() if False else Fb_ord[k, i:j].mean()), 4)})
-    return out
-sens = chain_risk(cen, "weibull", "Weibull分布(M1)")
-for sgn, lab in [(-1, "阈值−ŝ"), (1, "阈值+ŝ")]:
-    cen_s = build_censoring(0.04 + sgn * S_HAT)
-    sens += chain_risk(cen_s, "lognormal", lab)
-pd.DataFrame(sens).to_csv(os.path.join(OUT, "q3_dist_threshold_sensitivity.csv"), index=False, encoding="utf-8-sig")
-log["分布与阈值敏感性"] = sens
+# AFT 分布只影响首次跨越 F，不冒称会改变以当次 p 为核心的决策目标。
+rw = fit_aft(cen, MULTI, lam=lam_best, dist="weibull")
+mu_w = rw.x[0] + rw.x[1] * cen["B0c"].values[None, :] + (Xstd(cen, MULTI, rw.std_) @ rw.x[2:-1])[None, :]
+Fw_ord = (1 - np.exp(-np.exp((np.log(TGRID)[:, None] - mu_w) / np.exp(rw.x[-1]))))[:, oidx]
+aft_rows = []
+for gi, (i, j) in enumerate(cuts_main, 1):
+    kt = int(np.argmin(np.abs(TGRID - t_star_g[gi])))
+    aft_rows.append({"组": gi, "t*": t_star_g[gi],
+                     "对数正态F(t*)": round(float(F_ord[kt, i:j].mean()), 4),
+                     "Weibull F(t*)": round(float(Fw_ord[kt, i:j].mean()), 4)})
+pd.DataFrame(aft_rows).to_csv(os.path.join(OUT, "q3_aft_distribution_sensitivity.csv"), index=False, encoding="utf-8-sig")
 
-# ---------------- 11. bootstrap（M1+GEE+风险；含冻结方案风险） ----------------
+# ---------------- 11. 按孕妇 cluster bootstrap（当次模型 + 误差 + 分段优化） ----------------
 B_BOOT = 100
-stab, frozen_risk = [], {1: [], 2: []}
-frozen_bounds = [30.76]
-frozen_t = [float(TGRID[int(np.argmin((R0sum[:, j] - R0sum[:, i]) / (j - i)))]) for (i, j) in cuts_main]
+stab, frozen_score = [], {gi: [] for gi in range(1, len(cuts_main) + 1)}
+frozen_bounds = [(B0v[j - 1] + B0v[j]) / 2 for (i, j) in cuts_main[:-1]]
+frozen_t = [t_star_g[gi] for gi in range(1, len(cuts_main) + 1)]
+
+def cluster_bootstrap(rng):
+    sampled = rng.choice(cen["pid"].values, size=len(cen), replace=True)
+    bc_parts, ge_parts = [], []
+    for draw, pid in enumerate(sampled):
+        new_pid = f"boot_{draw}"
+        cpart = cen[cen["pid"] == pid].copy(); cpart["pid"] = new_pid
+        gpart = g_cov[g_cov["pid"] == pid].copy(); gpart["pid"] = new_pid
+        bc_parts.append(cpart); ge_parts.append(gpart)
+    return pd.concat(bc_parts, ignore_index=True), pd.concat(ge_parts, ignore_index=True)
+
+boot_fail = 0
 for b in range(B_BOOT):
     rng_b = np.random.default_rng(SEED + b)
-    bc = cen.iloc[rng_b.choice(len(cen), size=len(cen), replace=True)].reset_index(drop=True)
     try:
-        rb = fit_aft(bc, MULTI, lam=lam_best)
-        g_cov_b = g_cov[g_cov["pid"].isin(bc["pid"])]
-        gee_b = smf.gee(F_GEE, groups="pid", data=g_cov_b, family=sm.families.Binomial()).fit()
-        Pb = gee_p(gee_b, TGRID, bc)
+        bc, g_cov_b = cluster_bootstrap(rng_b)
+        curr_b = fit_logit_ridge(g_cov_b, CURR1, lam_curr1)
+        Pb = current_p_grid(curr_b, bc)
+        Ub = build_U(bc, S_HAT)
         ob = bc.sort_values("B0")
         Pb_ord = Pb[:, ob.index.values]
+        Ub_ord = Ub[:, ob.index.values]
         ob0 = ob["B0"].values
-        res_b, R_b = optimize_risk(Pb_ord, *W_BASE, gmax=g0)
+        res_b = optimize_score(Pb_ord, Ub_ord, *W_BASE, gmax=g0)
         cuts_b = res_b[g0]["cuts"]
-        R_bsum = np.hstack([np.zeros((R_b.shape[0], 1)), np.cumsum(R_b, axis=1)])
         bounds = [round((ob0[j - 1] + ob0[j]) / 2, 1) for (i, j) in cuts_b[:-1]]
         for gi, (i, j) in enumerate(cuts_b, 1):
-            Rbar = (R_bsum[:, j] - R_bsum[:, i]) / (j - i)
-            k = int(np.argmin(Rbar))
+            score = compromise_curve(Pb_ord[:, i:j], Ub_ord[:, i:j], *W_BASE)
+            k = int(np.argmin(score))
             stab.append({"b": b, "组": gi, "t*": float(TGRID[k]),
-                         "bounds": ";".join(f"{x:.1f}" for x in bounds), "R": round(float(Rbar[k]), 4)})
-        # 冻结方案（30.76 分界 + 冻结 t*）在该样本上的组内平均风险
-        grp = (ob0 >= frozen_bounds[0]).astype(int)
-        for gi in range(2):
+                         "bounds": ";".join(f"{x:.1f}" for x in bounds), "S": round(float(score[k]), 4)})
+        grp = np.digitize(ob0, frozen_bounds)
+        for gi in range(len(cuts_main)):
             cols = np.where(grp == gi)[0]
             if len(cols) >= 10:
                 kt = int(np.argmin(np.abs(TGRID - frozen_t[gi])))
-                frozen_risk[gi + 1].append(float(R_b[kt, cols].mean()))
+                score = compromise_curve(Pb_ord[:, cols], Ub_ord[:, cols], *W_BASE)
+                frozen_score[gi + 1].append(float(score[kt]))
     except Exception:
-        pass
+        boot_fail += 1
     if (b + 1) % 50 == 0:
         print(f"bootstrap {b + 1}/{B_BOOT}")
+
 stab_df = pd.DataFrame(stab)
+if stab_df.empty:
+    raise RuntimeError("bootstrap 全部失败")
 stab_df.to_csv(os.path.join(OUT, "q3_stability_boot.csv"), index=False, encoding="utf-8-sig")
 tstats = stab_df.groupby("组")["t*"].agg(["mean", "std",
     lambda s: s.quantile(0.05), lambda s: s.quantile(0.95)]).round(3)
 tstats.columns = ["t*_均值", "t*_SD", "t*_5%", "t*_95%"]
 bcnt = Counter()
-for s in stab_df["bounds"]:
-    for x in s.split(";"):
-        bcnt[x] += 1
+for s in stab_df.drop_duplicates("b")["bounds"]:
+    for x in str(s).split(";"):
+        if x:
+            bcnt[x] += 1
 with open(os.path.join(OUT, "q3_stability.csv"), "w", encoding="utf-8-sig", newline="") as f:
     tstats.to_csv(f)
-    f.write("\n# 分界点频次（前10）\n")
+    f.write("\n# 分界点频次（每次bootstrap只计一次，前10）\n")
     for x, c in bcnt.most_common(10):
         f.write(f"{x},{c}\n")
 log["稳定性_t*"] = tstats.to_dict()
 log["稳定性_分界点频次前5"] = bcnt.most_common(5)
-log["bootstrap成功次数"] = int(stab_df["b"].nunique())
-log["冻结方案风险区间(90%)"] = {g: [round(float(np.quantile(v, 0.05)), 4), round(float(np.quantile(v, 0.95)), 4)]
-                                  for g, v in frozen_risk.items() if len(v) > 10}
+log["bootstrap成功/失败"] = [int(stab_df["b"].nunique()), boot_fail]
+log["冻结方案折中得分区间(90%)"] = {
+    g: [round(float(np.quantile(v, 0.05)), 4), round(float(np.quantile(v, 0.95)), 4)]
+    for g, v in frozen_score.items() if len(v) > 10}
 if len(cuts_main) == 2:
     bvals = np.array([float(s) for s in stab_df.loc[stab_df["组"] == 1, "bounds"]])
     log["稳定性_分界点90%区间"] = [round(float(np.quantile(bvals, 0.05)), 1),
@@ -554,10 +651,11 @@ if len(cuts_main) == 2:
 
 np.save(os.path.join(OUT, "q3_grid_P.npy"), P_ord)
 np.save(os.path.join(OUT, "q3_grid_F.npy"), F_ord)
-np.save(os.path.join(OUT, "q3_grid_R.npy"), R0)
+np.save(os.path.join(OUT, "q3_grid_R.npy"), S_plot)
 order[["pid", "B0"]].to_csv(os.path.join(OUT, "q3_order.csv"), index=False)
 json.dump({"cuts": [[int(i), int(j)] for i, j in cuts_main], "g_chosen": int(g0),
-           "lam": lam_best, "body_scheme": body_scheme},
+           "aft_lam": lam_best, "current_lam": lam_curr1, "body_scheme": body_scheme,
+           "criterion": "normalized ideal-point distance"},
           open(os.path.join(OUT, "q3_cuts.json"), "w"))
 with open(os.path.join(OUT, "q3_run_summary.json"), "w", encoding="utf-8") as f:
     json.dump(log, f, ensure_ascii=False, indent=2, default=str)

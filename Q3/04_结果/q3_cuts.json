@@ -1,1 +1,1 @@
-{"cuts": [[0, 51], [51, 267]], "g_chosen": 2, "lam": 10.0, "body_scheme": "B(\u4f53\u91cd+\u8eab\u9ad8)"}
+{"cuts": [[0, 206], [206, 267]], "g_chosen": 2, "aft_lam": 100.0, "current_lam": 3.0, "body_scheme": "A(BMI+\u8eab\u9ad8\uff0c\u4e3b\u94fe\uff1bB\u4f5c\u91cd\u53c2\u6570\u5316\u654f\u611f\u6027)", "criterion": "normalized ideal-point distance"}

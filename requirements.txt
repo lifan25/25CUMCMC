@@ -5,3 +5,4 @@ patsy>=0.5
 scipy>=1.10
 matplotlib>=3.7
 openpyxl>=3.1
+scikit-learn>=1.4

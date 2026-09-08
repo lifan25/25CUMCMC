@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Q3 v4 绘图：折中曲线、偏好敏感性、个体建议、bootstrap 稳定性。"""
+"""Q3 v5 绘图：折中曲线、嵌套区间、偏好敏感性与稳定性。"""
 import os, json
 import numpy as np
 import pandas as pd
@@ -116,4 +116,28 @@ for gi, cc in zip([1, 2], [C1, C2]):
 axes[1].set(xlabel="组", ylabel="t*（周）", title="t* 的 bootstrap 分布",
             xticks=[1, 2], xticklabels=["低 BMI 组", "高 BMI 组"])
 save(fig, "process_q3_stability.png")
+
+# 图5 核心：BMI—年龄—身高嵌套区间及组内可靠性
+nested = pd.read_csv(os.path.join(RES, "q3_nested_groups_main.csv"))
+labels = [f"{r.子组}  {r.年龄区间}，{r.身高区间}" for r in nested.itertuples()]
+y = np.arange(len(nested))
+bar_colors = [C1 if g == 1 else C2 for g in nested["BMI主组"]]
+fig, ax = plt.subplots(figsize=(7.2, 4.2))
+ax.barh(y, nested["组内平均当次p(t*)"], color=bar_colors, alpha=0.82, height=0.65)
+ax.axvline(0.8, color=C_TH, lw=0.9, ls="--", label="p=0.8 复检阈值")
+for yi, r in nested.iterrows():
+    ax.text(float(r["组内平均当次p(t*)"]) + 0.004, yi,
+            f"{r['推荐时点t*']:.1f}周，n={int(r['人数'])}", va="center", fontsize=6.5)
+ax.set_yticks(y)
+ax.set_yticklabels(labels, fontsize=6.5)
+ax.invert_yaxis()
+ax.set_xlim(0.70, 1.01)
+ax.set(xlabel="组内平均当次达标概率 p(t*)",
+       title="BMI主组内年龄—身高嵌套区间的检测可靠性")
+from matplotlib.patches import Patch
+nested_handles = [Patch(facecolor=C1, alpha=0.82, label="BMI < 33.5"),
+                  Patch(facecolor=C2, alpha=0.82, label="BMI ≥ 33.5"),
+                  Line2D([], [], color=C_TH, ls="--", lw=0.9, label="p=0.8 复检阈值")]
+ax.legend(handles=nested_handles, frameon=False, fontsize=6.5, loc="lower right")
+save(fig, "result_q3_nested_groups.png")
 print("ALL DONE")

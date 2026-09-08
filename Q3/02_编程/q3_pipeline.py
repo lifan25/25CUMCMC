@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Q3 v4：M0(BMI-only) 基准 + M1 多因素岭模型 + 多目标折中优化。
+"""Q3 v5：BMI 一级分组 + 年龄/身高嵌套区间 + 多因素风险优化。
 当次达标模型采用按孕妇等权的岭 Logistic，避免稀疏孕产史类别完全分离；
-BMI 负责形成可执行分组，其他因素进入组内概率、风险和个体复检建议。
+BMI 负责一级分组，年龄和身高形成受约束二级区间，孕产史进入组内风险。
 运行: python q3_pipeline.py [--xlsx 附件路径]   输出: Q3/04_结果/
 """
 import sys, os, json, argparse
@@ -28,10 +28,13 @@ OBSOLETE_FIGURES = ["result_q3_effect_forest.png", "result_q3_group_timing.png"]
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--xlsx", default=os.path.join(REPO, "..", "附件.xlsx"))
+ap.add_argument("--bootstrap", type=int, default=100, help="正式默认100；调试可用较小正整数")
 args = ap.parse_args()
 XLSX = os.path.abspath(args.xlsx)
 if not os.path.isfile(XLSX):
     sys.exit(f"附件不存在: {XLSX}")
+if args.bootstrap < 1:
+    sys.exit("--bootstrap 必须为正整数")
 for name in OBSOLETE_RESULTS:
     path = os.path.join(OUT, name)
     if os.path.isfile(path):
@@ -362,13 +365,18 @@ def compromise_curve(Pseg, Useg, wr=1.0, wd=1.0):
     den = np.sqrt(wr ** 2 + wd ** 2) or 1.0
     return np.sqrt((wr * fn) ** 2 + (wd * dn) ** 2) / den
 
-N = len(cen); MIN_N = 30
+N = len(cen)
+NEST_MIN = 12
+MIN_N = 4 * NEST_MIN  # 每个BMI主组须容纳四个年龄/身高嵌套叶组
 order = cen.sort_values("B0")
 oidx = order.index.values
 B0v = order["B0"].values
 
 def optimize_score(P, U, wr=1.0, wd=1.0, gmax=5, min_n=MIN_N):
     n = P.shape[1]
+    gmax = min(gmax, n // min_n)
+    if gmax < 2:
+        raise RuntimeError(f"样本量{n}不足以形成两个每组至少{min_n}人的BMI主组")
     psum = np.hstack([np.zeros((P.shape[0], 1)), np.cumsum(P, axis=1)])
     usum = np.hstack([np.zeros((U.shape[0], 1)), np.cumsum(U, axis=1)])
     @lru_cache(maxsize=None)
@@ -436,6 +444,95 @@ def scheme_rows(res, P, F, U, label):
                     "折中得分S(t*)": round(float(score[k]), 4)})
     return out, g_sel
 
+# ---------------- 7.1 BMI 组内年龄/身高嵌套区间 ----------------
+
+def _thresholds(values, min_side):
+    """只在相邻观测值中点切分，并保证两侧最小样本量。"""
+    vals = np.asarray(values, dtype=float)
+    uniq = np.unique(vals)
+    mids = (uniq[:-1] + uniq[1:]) / 2
+    return [float(x) for x in mids
+            if np.sum(vals < x) >= min_side and np.sum(vals >= x) >= min_side]
+
+def _leaf_cost(P, U, idx):
+    score = compromise_curve(P[:, idx], U[:, idx], *W_BASE)
+    k = int(np.argmin(score))
+    return len(idx) * float(score[k]), k
+
+def _best_second_split(cov_order, P, U, idx, var, min_leaf=NEST_MIN):
+    vals = cov_order[var].to_numpy(dtype=float)
+    best = None
+    for cut in _thresholds(vals[idx], min_leaf):
+        left = idx[vals[idx] < cut]
+        right = idx[vals[idx] >= cut]
+        cost = _leaf_cost(P, U, left)[0] + _leaf_cost(P, U, right)[0]
+        balance = abs(len(left) - len(right))
+        cand = (cost, balance, cut, left, right)
+        if best is None or cand[:3] < best[:3]:
+            best = cand
+    return best
+
+def fit_nested_tree(cov_order, P, U, i, j, min_leaf=NEST_MIN):
+    """比较年龄→身高与身高→年龄，求固定四叶嵌套区间的最小得分。"""
+    root = np.arange(i, j)
+    best = None
+    for first, second in [("age0", "height0"), ("height0", "age0")]:
+        vals = cov_order[first].to_numpy(dtype=float)
+        for cut1 in _thresholds(vals[root], 2 * min_leaf):
+            branches = [root[vals[root] < cut1], root[vals[root] >= cut1]]
+            seconds = [_best_second_split(cov_order, P, U, z, second, min_leaf) for z in branches]
+            if any(x is None for x in seconds):
+                continue
+            leaves = [seconds[0][3], seconds[0][4], seconds[1][3], seconds[1][4]]
+            cost = sum(_leaf_cost(P, U, z)[0] for z in leaves)
+            balance = max(len(z) for z in leaves) - min(len(z) for z in leaves)
+            cand = (cost, balance, first, cut1, second, seconds, leaves)
+            if best is None or cand[:2] < best[:2]:
+                best = cand
+    if best is None:
+        raise RuntimeError(f"BMI组[{i},{j})无法形成每叶至少{min_leaf}人的年龄/身高嵌套区间")
+    return {"cost": best[0], "first": best[2], "first_cut": best[3],
+            "second": best[4], "second_cuts": [best[5][0][2], best[5][1][2]],
+            "leaves": best[6]}
+
+def _fmt_interval(lo, hi, unit=""):
+    if lo is None:
+        return f"<{hi:.1f}{unit}"
+    if hi is None:
+        return f"≥{lo:.1f}{unit}"
+    return f"[{lo:.1f}, {hi:.1f}){unit}"
+
+def nested_scheme(cov_order, cuts, P, F, U):
+    rows, trees = [], []
+    for gi, (i, j) in enumerate(cuts, 1):
+        tree = fit_nested_tree(cov_order, P, U, i, j)
+        trees.append(tree)
+        first, second = tree["first"], tree["second"]
+        cut1 = tree["first_cut"]
+        for li, idx in enumerate(tree["leaves"]):
+            branch = li // 2
+            second_cut = tree["second_cuts"][branch]
+            bounds = {"age0": [None, None], "height0": [None, None]}
+            bounds[first] = [None, cut1] if branch == 0 else [cut1, None]
+            bounds[second] = [None, second_cut] if li % 2 == 0 else [second_cut, None]
+            _, k = _leaf_cost(P, U, idx)
+            score = compromise_curve(P[:, idx], U[:, idx], *W_BASE)
+            low_n = int(np.sum(P[k, idx] < 0.80))
+            rows.append({"BMI主组": gi, "子组": f"{gi}-{li + 1}",
+                         "BMI区间": main_rows[gi - 1]["BMI区间"],
+                         "年龄区间": _fmt_interval(*bounds["age0"], unit="岁"),
+                         "身高区间": _fmt_interval(*bounds["height0"], unit="cm"),
+                         "人数": len(idx), "推荐时点t*": float(TGRID[k]),
+                         "组内平均当次p(t*)": round(float(P[k, idx].mean()), 4),
+                         "组内平均F(t*)": round(float(F[k, idx].mean()), 4),
+                         "组内平均误判率U(t*)": round(float(U[k, idx].mean()), 4),
+                         "折中得分S(t*)": round(float(score[k]), 4),
+                         "当次p<0.8人数": low_n,
+                         "执行建议": ("按推荐时点检测" if low_n == 0 else
+                                  f"按推荐时点检测；其中{low_n}人需预设复检"),
+                         "分层顺序": f"{first}→{second}"})
+    return pd.DataFrame(rows), trees
+
 risk_rows = []
 main_scen = {}
 for lab, (wr, wd) in SCEN.items():
@@ -482,6 +579,22 @@ main_df = pd.DataFrame(main_rows)
 main_df.to_csv(os.path.join(OUT, "q3_groups_main.csv"), index=False, encoding="utf-8-sig")
 log["基准主方案"] = main_rows
 log["锚点C_低组不晚于高组"] = bool(main_df["基础推荐时点t*"].iloc[0] <= main_df["基础推荐时点t*"].iloc[-1])
+
+# 用户明确要求的正式分层：每个 BMI 主组内比较两种年龄/身高嵌套顺序。
+nested_df, nested_trees = nested_scheme(order, cuts_main, P_ord, F_ord, U_ord)
+nested_df.to_csv(os.path.join(OUT, "q3_nested_groups_main.csv"), index=False, encoding="utf-8-sig")
+primary_cost = float(sum(_leaf_cost(P_ord, U_ord, np.arange(i, j))[0] for i, j in cuts_main))
+nested_cost = float(sum(x["cost"] for x in nested_trees))
+nested_gain = (primary_cost - nested_cost) / primary_cost
+log["年龄身高嵌套分层"] = {
+    "每子组最小人数": NEST_MIN,
+    "各BMI组分层顺序": [f"{x['first']}→{x['second']}" for x in nested_trees],
+    "一级方案总得分": round(primary_cost, 4),
+    "嵌套方案总得分": round(nested_cost, 4),
+    "样本内相对改善": round(float(nested_gain), 4),
+    "正式子组": nested_df.to_dict("records")}
+assert len(nested_df) == 4 * len(cuts_main)
+assert nested_df["人数"].sum() == N and nested_df["人数"].min() >= NEST_MIN
 
 # ---------------- 8. 个体时点修正 ----------------
 t_star_g = {gi: float(TGRID[int(np.argmin(compromise_curve(P_ord[:, i:j], U_ord[:, i:j], *W_BASE)))])
@@ -539,6 +652,9 @@ gain_rows = [
     {"指标": "BMI 分界点", "M0(BMI-only)": m0_rows[0]["BMI区间"], "M1(多因素)": main_rows[0]["BMI区间"]},
     {"指标": "基础推荐时点(各组)", "M0(BMI-only)": ";".join(f"{r['t*']}" for r in m0_rows),
      "M1(多因素)": ";".join(f"{r['基础推荐时点t*']}" for r in main_rows)},
+    {"指标": "分层决策总得分", "M1多因素基础": round(primary_cost, 4),
+     "M1嵌套区间": round(nested_cost, 4)},
+    {"指标": "嵌套区间样本内相对改善", "M1嵌套区间": round(float(nested_gain), 4)},
     {"指标": "个体后移人数", "M0(BMI-only)": 0, "M1多因素基础": 0,
      "M1多因素+个体层": int((adj_df["调整量Δ"] > 0).sum())},
     {"指标": "建议复检人数", "M0(BMI-only)": int((m0_person_p < 0.8).sum()),
@@ -574,8 +690,9 @@ for gi, (i, j) in enumerate(cuts_main, 1):
 pd.DataFrame(aft_rows).to_csv(os.path.join(OUT, "q3_aft_distribution_sensitivity.csv"), index=False, encoding="utf-8-sig")
 
 # ---------------- 11. 按孕妇 cluster bootstrap（当次模型 + 误差 + 分段优化） ----------------
-B_BOOT = 100
+B_BOOT = args.bootstrap
 stab, frozen_score = [], {gi: [] for gi in range(1, len(cuts_main) + 1)}
+nested_boot = []
 frozen_bounds = [(B0v[j - 1] + B0v[j]) / 2 for (i, j) in cuts_main[:-1]]
 frozen_t = [t_star_g[gi] for gi in range(1, len(cuts_main) + 1)]
 
@@ -609,6 +726,20 @@ for b in range(B_BOOT):
             k = int(np.argmin(score))
             stab.append({"b": b, "组": gi, "t*": float(TGRID[k]),
                          "bounds": ";".join(f"{x:.1f}" for x in bounds), "S": round(float(score[k]), 4)})
+        # 重新选择嵌套顺序及切点；某次嵌套不可行不抹掉该次一级方案结果。
+        nested_one = []
+        try:
+            for gi, (i, j) in enumerate(cuts_b, 1):
+                tree_b = fit_nested_tree(ob, Pb_ord, Ub_ord, i, j)
+                nested_one.append({"b": b, "BMI主组": gi,
+                                   "第一层变量": tree_b["first"],
+                                   "第一层切点": round(float(tree_b["first_cut"]), 3),
+                                   "第二层变量": tree_b["second"],
+                                   "低分支第二切点": round(float(tree_b["second_cuts"][0]), 3),
+                                   "高分支第二切点": round(float(tree_b["second_cuts"][1]), 3)})
+            nested_boot.extend(nested_one)
+        except RuntimeError:
+            pass
         grp = np.digitize(ob0, frozen_bounds)
         for gi in range(len(cuts_main)):
             cols = np.where(grp == gi)[0]
@@ -618,13 +749,15 @@ for b in range(B_BOOT):
                 frozen_score[gi + 1].append(float(score[kt]))
     except Exception:
         boot_fail += 1
-    if (b + 1) % 50 == 0:
+    if (b + 1) % max(1, min(10, B_BOOT)) == 0:
         print(f"bootstrap {b + 1}/{B_BOOT}")
 
 stab_df = pd.DataFrame(stab)
 if stab_df.empty:
     raise RuntimeError("bootstrap 全部失败")
 stab_df.to_csv(os.path.join(OUT, "q3_stability_boot.csv"), index=False, encoding="utf-8-sig")
+nested_boot_df = pd.DataFrame(nested_boot)
+nested_boot_df.to_csv(os.path.join(OUT, "q3_nested_stability_boot.csv"), index=False, encoding="utf-8-sig")
 tstats = stab_df.groupby("组")["t*"].agg(["mean", "std",
     lambda s: s.quantile(0.05), lambda s: s.quantile(0.95)]).round(3)
 tstats.columns = ["t*_均值", "t*_SD", "t*_5%", "t*_95%"]
@@ -641,6 +774,23 @@ with open(os.path.join(OUT, "q3_stability.csv"), "w", encoding="utf-8-sig", newl
 log["稳定性_t*"] = tstats.to_dict()
 log["稳定性_分界点频次前5"] = bcnt.most_common(5)
 log["bootstrap成功/失败"] = [int(stab_df["b"].nunique()), boot_fail]
+complete_nested = int((nested_boot_df.groupby("b")["BMI主组"].nunique() == len(cuts_main)).sum())
+log["嵌套bootstrap成功/失败"] = [complete_nested, B_BOOT - complete_nested]
+log["嵌套结构bootstrap"] = {}
+for gi, g in nested_boot_df.groupby("BMI主组"):
+    by_var = {}
+    for var, gv in g.groupby("第一层变量"):
+        by_var[var] = {"次数": int(len(gv)),
+                       "切点90%区间": [round(float(gv["第一层切点"].quantile(0.05)), 2),
+                                      round(float(gv["第一层切点"].quantile(0.95)), 2)],
+                       "第二层变量": str(gv["第二层变量"].iloc[0]),
+                       "低分支第二切点90%区间": [round(float(gv["低分支第二切点"].quantile(0.05)), 2),
+                                               round(float(gv["低分支第二切点"].quantile(0.95)), 2)],
+                       "高分支第二切点90%区间": [round(float(gv["高分支第二切点"].quantile(0.05)), 2),
+                                               round(float(gv["高分支第二切点"].quantile(0.95)), 2)]}
+    log["嵌套结构bootstrap"][str(gi)] = {
+        "完整嵌套重抽样次数": complete_nested,
+        "第一层变量分项": by_var}
 log["冻结方案折中得分区间(90%)"] = {
     g: [round(float(np.quantile(v, 0.05)), 4), round(float(np.quantile(v, 0.95)), 4)]
     for g, v in frozen_score.items() if len(v) > 10}
@@ -655,7 +805,9 @@ np.save(os.path.join(OUT, "q3_grid_R.npy"), S_plot)
 order[["pid", "B0"]].to_csv(os.path.join(OUT, "q3_order.csv"), index=False)
 json.dump({"cuts": [[int(i), int(j)] for i, j in cuts_main], "g_chosen": int(g0),
            "aft_lam": lam_best, "current_lam": lam_curr1, "body_scheme": body_scheme,
-           "criterion": "normalized ideal-point distance"},
+           "criterion": "normalized ideal-point distance",
+           "nested_min_leaf": NEST_MIN,
+           "nested_orders": [f"{x['first']}->{x['second']}" for x in nested_trees]},
           open(os.path.join(OUT, "q3_cuts.json"), "w"))
 with open(os.path.join(OUT, "q3_run_summary.json"), "w", encoding="utf-8") as f:
     json.dump(log, f, ensure_ascii=False, indent=2, default=str)
